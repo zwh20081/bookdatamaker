@@ -57,7 +57,7 @@ pip install -r requirements.txt && pip install -e .
 # 2. Extract → Generate → Export
 bookdatamaker extract book.pdf -o ./extracted
 bookdatamaker generate ./extracted/combined.txt -d dataset.db --distribution "10,10,20,30,20,10"
-bookdatamaker export-dataset dataset.db output.parquet
+bookdatamaker export-dataset dataset.db -o output.parquet
 ```
 
 ### Option 2: Self-Hosted Mode (Free, Private)
@@ -77,7 +77,7 @@ bookdatamaker generate ./extracted/combined.txt \
   -d dataset.db
 
 # 4. Export
-bookdatamaker export-dataset dataset.db output.parquet
+bookdatamaker export-dataset dataset.db -o output.parquet
 ```
 
 ## Installation
@@ -259,16 +259,16 @@ Export from SQLite database to your preferred format:
 
 ```bash
 # Parquet (recommended for data analysis)
-bookdatamaker export-dataset dataset.db output.parquet
+bookdatamaker export-dataset dataset.db -o output.parquet
 
 # JSON Lines (easy to stream)
-bookdatamaker export-dataset dataset.db output.jsonl -f jsonl
+bookdatamaker export-dataset dataset.db -o output.jsonl -f jsonl
 
 # CSV (Excel-friendly)
-bookdatamaker export-dataset dataset.db output.csv -f csv
+bookdatamaker export-dataset dataset.db -o output.csv -f csv
 
 # JSON with metadata
-bookdatamaker export-dataset dataset.db output.json -f json --include-metadata
+bookdatamaker export-dataset dataset.db -o output.json -f json --include-metadata
 ```
 
 **Format Comparison:**
