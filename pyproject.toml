@@ -53,6 +53,11 @@ all = [
     "PyMuPDF",
     "ebooklib",
     "beautifulsoup4",
+    "google-auth",
+]
+
+gcp = [
+    "google-auth"
 ]
 
 dev = [

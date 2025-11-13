@@ -81,6 +81,11 @@ class ParallelDatasetGenerator:
         max_model_len: Optional[int] = None,
         custom_prompt: Optional[str] = None,
         tool_call_parser: Optional[str] = None,
+        gcp_project_id: Optional[str] = None,
+        gcp_location: Optional[str] = None,
+        gcp_publisher: Optional[str] = None,
+        gcp_model_id: Optional[str] = None,
+        gcp_token_refresh_interval: int = 1800,
     ) -> None:
         """Initialize parallel dataset generator.
 
@@ -114,6 +119,97 @@ class ParallelDatasetGenerator:
         self.custom_prompt = custom_prompt
         self.tool_call_parser = tool_call_parser
         self.vllm_llm = None  # Will be initialized if using vLLM mode
+        self.gcp_project_id = gcp_project_id
+        self.gcp_location = gcp_location
+        self.gcp_publisher = gcp_publisher
+        self.gcp_model_id = gcp_model_id
+        self.gcp_mode = bool(gcp_project_id)
+        self.gcp_token_refresh_interval = gcp_token_refresh_interval
+        self._gcp_last_token_refresh = time.time() if self.gcp_mode else None
+
+        # If GCP mode requested, initialize GCP auth and override API URL + key
+        if self.mode == "api" and self.gcp_mode:
+            # Validate required params
+            missing = [
+                ("gcp_location", self.gcp_location),
+                ("gcp_publisher", self.gcp_publisher),
+                ("gcp_model_id", self.gcp_model_id),
+            ]
+            missing_fields = [name for name, val in missing if not val]
+            if missing_fields:
+                raise ValueError(
+                    "GCP Vertex AI mode enabled but missing required parameters: " + ", ".join(missing_fields)
+                )
+
+            try:
+                import google.auth  # type: ignore
+                import google.auth.transport.requests  # type: ignore
+            except ImportError as e:
+                raise ImportError(
+                    "google-auth not installed. Install with: pip install bookdatamaker[gcp] or pip install google-auth"
+                ) from e
+
+            # Acquire credentials
+            creds, _ = google.auth.default()
+            auth_req = google.auth.transport.requests.Request()
+            creds.refresh(auth_req)
+            token = creds.token
+            self._gcp_creds = creds  # keep for future refresh
+
+            # Construct endpoint URL (Vertex AI predict endpoint)
+            endpoint_url = (
+                f"https://{self.gcp_location}-aiplatform.googleapis.com/v1/" 
+                f"projects/{self.gcp_project_id}/locations/{self.gcp_location}" \
+                f"/publishers/{self.gcp_publisher}/models/{self.gcp_model_id}:predict"
+            )
+
+            # Override OpenAI client config
+            self.openai_api_url = endpoint_url
+            self.openai_api_key = token  # Use GCP access token as API key for SDK
+            # In Vertex AI publisher endpoints, model ID is embedded in URL; set model to empty if None provided
+            if self.model is None:
+                self.model = ""  # Explicit blank model
+
+            # Store metadata about mode for later session tracking
+            # Save metadata (delayed import of json)
+            try:
+                import json as _json
+                from bookdatamaker.dataset.dataset_manager import DatasetManager
+                dm = DatasetManager(str(self.db_path))
+                dm.save_session_metadata("gcp_mode", _json.dumps({
+                    "project_id": self.gcp_project_id,
+                    "location": self.gcp_location,
+                    "publisher": self.gcp_publisher,
+                    "model_id": self.gcp_model_id
+                }, ensure_ascii=False))
+                dm.close()
+            except Exception:
+                # Non-fatal; continue
+                pass
+
+    def _maybe_refresh_gcp_token(self) -> bool:
+        """Refresh GCP access token if interval exceeded (GCP mode only).
+
+        Returns:
+            bool: True if token was refreshed.
+        """
+        if not self.gcp_mode:
+            return False
+        now = time.time()
+        if self._gcp_last_token_refresh is None:
+            self._gcp_last_token_refresh = now
+            return False
+        if now - self._gcp_last_token_refresh >= self.gcp_token_refresh_interval:
+            try:
+                import google.auth.transport.requests  # type: ignore
+                auth_req = google.auth.transport.requests.Request()  # type: ignore
+                self._gcp_creds.refresh(auth_req)  # type: ignore
+                self.openai_api_key = self._gcp_creds.token  # type: ignore
+                self._gcp_last_token_refresh = now
+                return True
+            except Exception:
+                return False
+        return False
         
         # Progress tracking
         self.progress_lock = None
@@ -632,6 +728,15 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                 
                 for iteration in range(max_iterations):
                     try:
+                        # GCP token refresh check (recreate client if refreshed)
+                        if self.gcp_mode:
+                            refreshed = self._maybe_refresh_gcp_token()
+                            if refreshed:
+                                client = OpenAI(
+                                    base_url=self.openai_api_url,
+                                    api_key=self.openai_api_key,
+                                    timeout=600.0,
+                                )
                         # Log conversation length for debugging
                         if iteration % 5 == 0:
                             with self.log_lock:
