@@ -102,32 +102,6 @@ bookdatamaker generate ./extracted -d dataset.db --distribution "10,10,20,30,20,
 bookdatamaker export-dataset dataset.db -o output.parquet
 ```
 
-### Option 1B: GCP Vertex AI
-
-Use GCP's Vertex AI to directly connect to maas LLMs.
-
-```bash
-# 1. Install (with GCP support)
-pip install bookdatamaker[gcp]
-
-# 2. license
-# a) service account JSON：
-export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
-# b) Application Default Credentials：
-gcloud auth application-default login
-bookdatamaker generate ./extracted -d dataset.db \
-  --distribution "10,10,20,30,20,10" \
-  --gcp-project-id your-project-id \
-  --gcp-location us-west2 \
-  --gcp-publisher deepseek \
-  --gcp-model-id deepseek-v3.1-maas \
-  --gcp-token-refresh-interval 1800
-
-# 4. export
-bookdatamaker export-dataset dataset.db -o output.parquet
-
-```
-
 ### Option 2: Self-Hosted Mode (Free, Private)
 
 ```bash

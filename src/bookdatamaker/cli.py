@@ -295,40 +295,6 @@ async def _extract_async(
     type=str,
     help="Tool call parser name for vLLM mode (required when using vllm mode). Example: 'hermes', 'mistral'",
 )
-@click.option(
-    "--gcp-project-id",
-    envvar="GCP_PROJECT_ID",
-    type=str,
-    help="GCP Project ID (enable GCP Vertex AI mode if provided)",
-)
-@click.option(
-    "--gcp-location",
-    envvar="GCP_LOCATION",
-    type=str,
-    default=None,
-    help="GCP Location/region (e.g. us-west2). Required for GCP mode",
-)
-@click.option(
-    "--gcp-publisher",
-    envvar="GCP_PUBLISHER",
-    type=str,
-    default=None,
-    help="Model publisher on Vertex AI (e.g. deepseek). Required for GCP mode",
-)
-@click.option(
-    "--gcp-model-id",
-    envvar="GCP_MODEL_ID",
-    type=str,
-    default=None,
-    help="Model ID on Vertex AI (e.g. deepseek-v3.1-maas). Required for GCP mode",
-)
-@click.option(
-    "--gcp-token-refresh-interval",
-    type=int,
-    default=1800,
-    show_default=True,
-    help="Seconds between automatic GCP access token refresh (GCP mode only).",
-)
 def generate(
     extracted_dir: Path,
     db: Path,
@@ -343,11 +309,6 @@ def generate(
     max_model_len: Optional[int],
     custom_prompt: Optional[str],
     tool_call_parser: Optional[str],
-    gcp_project_id: Optional[str],
-    gcp_location: Optional[str],
-    gcp_publisher: Optional[str],
-    gcp_model_id: Optional[str],
-    gcp_token_refresh_interval: int,
 ) -> None:
     """Generate dataset using parallel LLM threads with MCP navigation.
 
@@ -364,25 +325,8 @@ def generate(
         bookdatamaker generate combined.txt -d dataset.db --mode vllm \
             --vllm-model-path meta-llama/Llama-3-8B-Instruct -t 4
     """
-    # Detect GCP mode: if project id provided, we expect all four GCP parameters
-    gcp_mode = bool(gcp_project_id)
-
-    if mode == "api" and gcp_mode:
-        missing = [
-            ("--gcp-location", gcp_location),
-            ("--gcp-publisher", gcp_publisher),
-            ("--gcp-model-id", gcp_model_id),
-        ]
-        missing_flags = [flag for flag, val in missing if not val]
-        if missing_flags:
-            click.echo(
-                "Error: GCP mode enabled (gcp-project-id provided) but missing required flags: "
-                + ", ".join(missing_flags),
-                err=True,
-            )
-            raise click.Abort()
-    elif mode == "api" and not openai_api_key and not gcp_mode:
-        click.echo("Error: OpenAI API key required for API mode (or provide --gcp-project-id for GCP mode)", err=True)
+    if mode == "api" and not openai_api_key:
+        click.echo("Error: OpenAI API key required for API mode", err=True)
         raise click.Abort()
     
     if mode == "vllm":
@@ -408,11 +352,6 @@ def generate(
             max_model_len,
             custom_prompt,
             tool_call_parser,
-            gcp_project_id,
-            gcp_location,
-            gcp_publisher,
-            gcp_model_id,
-            gcp_token_refresh_interval,
         )
     )
 
@@ -431,11 +370,6 @@ async def _generate_async(
     max_model_len: Optional[int],
     custom_prompt: Optional[str],
     tool_call_parser: Optional[str],
-    gcp_project_id: Optional[str],
-    gcp_location: Optional[str],
-    gcp_publisher: Optional[str],
-    gcp_model_id: Optional[str],
-    gcp_token_refresh_interval: int,
 ) -> None:
     """Async implementation of parallel dataset generation."""
     from bookdatamaker.llm.parallel_generator import ParallelDatasetGenerator
@@ -484,11 +418,6 @@ async def _generate_async(
         max_model_len=max_model_len,
         custom_prompt=custom_prompt,
         tool_call_parser=tool_call_parser,
-        gcp_project_id=gcp_project_id,
-        gcp_location=gcp_location,
-        gcp_publisher=gcp_publisher,
-        gcp_model_id=gcp_model_id,
-        gcp_token_refresh_interval=gcp_token_refresh_interval,
     )
 
     click.echo(f"\nStarting {generator.num_threads} parallel threads")
