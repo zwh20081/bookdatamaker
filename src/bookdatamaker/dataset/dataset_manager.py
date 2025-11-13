@@ -161,10 +161,10 @@ class DatasetManager:
         
         with output_file.open("w", encoding="utf-8") as f:
             for entry in entries:
-                # Write only input and output (no metadata for simplicity)
+                # Write only prompt and response (no metadata for simplicity)
                 record = {
-                    "input": entry["input"],
-                    "output": entry["output"]
+                    "prompt": entry["prompt"],
+                    "response": entry["response"]
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         
@@ -187,8 +187,8 @@ class DatasetManager:
         
         # Prepare data for DataFrame
         data = {
-            "input": [e["input"] for e in entries],
-            "output": [e["output"] for e in entries]
+            "prompt": [e["prompt"] for e in entries],
+            "response": [e["response"] for e in entries]
         }
         
         if include_metadata:
@@ -220,8 +220,8 @@ class DatasetManager:
         
         # Prepare data for DataFrame
         data = {
-            "input": [e["input"] for e in entries],
-            "output": [e["output"] for e in entries]
+            "prompt": [e["prompt"] for e in entries],
+            "response": [e["response"] for e in entries]
         }
         
         if include_metadata:
@@ -249,9 +249,9 @@ class DatasetManager:
         entries = self.get_all_entries()
         
         if not include_metadata:
-            # Simplify entries to only input/output
+            # Simplify entries to only prompt/response
             entries = [
-                {"input": e["input"], "output": e["output"]}
+                {"prompt": e["prompt"], "response": e["response"]}
                 for e in entries
             ]
         

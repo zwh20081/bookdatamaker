@@ -131,7 +131,7 @@ def show_cli_commands():
    with open('output.jsonl', 'r') as f:
        for line in f:
            entry = json.loads(line)
-           print(entry['input'], '→', entry['output'])
+           print(entry['prompt'], '→', entry['response'])
    ```
    
    Python 读取 Parquet:
