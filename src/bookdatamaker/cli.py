@@ -14,11 +14,16 @@ from bookdatamaker.ocr import OCRExtractor
 from bookdatamaker.utils import PageManager
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.version_option(version="0.1.0")
-def cli() -> None:
+@click.pass_context
+def cli(ctx: click.Context) -> None:
     """Book Data Maker - Extract text and generate datasets."""
     load_dotenv()
+    
+    # Show help if no command provided
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
 
 
 @cli.command()

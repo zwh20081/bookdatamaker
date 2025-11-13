@@ -8,7 +8,6 @@ import os
 
 import httpx
 from PIL import Image
-import torch
 
 
 class OCRExtractor:
@@ -74,6 +73,18 @@ class OCRExtractor:
     def _init_local_model(self) -> None:
         """Initialize local transformers model."""
         import importlib.metadata
+        
+        # Import torch here (only when needed for local mode)
+        try:
+            import torch
+        except ImportError:
+            raise ImportError(
+                "PyTorch not found. Please install it for local mode:\n"
+                "  pip install bookdatamaker[local]"
+            )
+        
+        # Store torch reference for later use
+        self.torch = torch
         
         # Check transformers version
         try:
@@ -217,10 +228,10 @@ class OCRExtractor:
         )
         
         # Move inputs to GPU
-        inputs = {k: v.cuda() if isinstance(v, torch.Tensor) else v 
+        inputs = {k: v.cuda() if isinstance(v, self.torch.Tensor) else v 
                   for k, v in inputs.items()}
         
-        with torch.no_grad():
+        with self.torch.no_grad():
             outputs = self.model.generate(**inputs, max_new_tokens=8192)
         
         # Decode output
