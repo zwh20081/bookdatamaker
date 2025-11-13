@@ -29,25 +29,49 @@ class DatasetManager:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS dataset (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                input TEXT NOT NULL,
-                output TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                response TEXT NOT NULL,
                 metadata TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        # Create thread state table for resume support
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS thread_state (
+                thread_id INTEGER PRIMARY KEY,
+                start_position INTEGER NOT NULL,
+                current_position INTEGER NOT NULL,
+                submitted_count INTEGER DEFAULT 0,
+                target_count INTEGER NOT NULL,
+                status TEXT DEFAULT 'running',
+                messages TEXT,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create session metadata table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS session_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         self.conn.commit()
 
     def add_entry(
         self, 
-        input_text: str, 
-        output_text: str,
+        prompt: str, 
+        response: str,
         metadata: Optional[Dict] = None
     ) -> int:
         """Add a Q&A entry to the dataset.
 
         Args:
-            input_text: Question or input text
-            output_text: Answer or output text
+            prompt: Question or prompt text
+            response: Answer or response text
             metadata: Optional metadata (e.g., source location)
 
         Returns:
@@ -57,8 +81,8 @@ class DatasetManager:
         metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
         
         cursor.execute(
-            "INSERT INTO dataset (input, output, metadata) VALUES (?, ?, ?)",
-            (input_text, output_text, metadata_json)
+            "INSERT INTO dataset (prompt, response, metadata) VALUES (?, ?, ?)",
+            (prompt, response, metadata_json)
         )
         self.conn.commit()
         return cursor.lastrowid
@@ -74,7 +98,7 @@ class DatasetManager:
         """
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT id, input, output, metadata, created_at FROM dataset WHERE id = ?",
+            "SELECT id, prompt, response, metadata, created_at FROM dataset WHERE id = ?",
             (entry_id,)
         )
         row = cursor.fetchone()
@@ -82,8 +106,8 @@ class DatasetManager:
         if row:
             return {
                 "id": row[0],
-                "input": row[1],
-                "output": row[2],
+                "prompt": row[1],
+                "response": row[2],
                 "metadata": json.loads(row[3]) if row[3] else None,
                 "created_at": row[4]
             }
@@ -97,15 +121,15 @@ class DatasetManager:
         """
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT id, input, output, metadata, created_at FROM dataset ORDER BY id"
+            "SELECT id, prompt, response, metadata, created_at FROM dataset ORDER BY id"
         )
         
         entries = []
         for row in cursor.fetchall():
             entries.append({
                 "id": row[0],
-                "input": row[1],
-                "output": row[2],
+                "prompt": row[1],
+                "response": row[2],
                 "metadata": json.loads(row[3]) if row[3] else None,
                 "created_at": row[4]
             })
@@ -266,3 +290,157 @@ class DatasetManager:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit."""
         self.close()
+    
+    # Thread state management methods for resume support
+    
+    def save_thread_state(
+        self,
+        thread_id: int,
+        start_position: int,
+        current_position: int,
+        submitted_count: int,
+        target_count: int,
+        status: str,
+        messages: List[Dict]
+    ) -> None:
+        """Save or update thread state for resume support.
+        
+        Args:
+            thread_id: Thread identifier
+            start_position: Starting page/position
+            current_position: Current page/position
+            submitted_count: Number of Q&A pairs submitted
+            target_count: Target number of Q&A pairs
+            status: Thread status (running, completed, error)
+            messages: Conversation history
+        """
+        cursor = self.conn.cursor()
+        messages_json = json.dumps(messages, ensure_ascii=False)
+        
+        cursor.execute("""
+            INSERT OR REPLACE INTO thread_state 
+            (thread_id, start_position, current_position, submitted_count, target_count, status, messages, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (thread_id, start_position, current_position, submitted_count, target_count, status, messages_json))
+        
+        self.conn.commit()
+    
+    def get_thread_state(self, thread_id: int) -> Optional[Dict]:
+        """Get thread state by ID.
+        
+        Args:
+            thread_id: Thread identifier
+            
+        Returns:
+            Thread state dictionary or None
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT thread_id, start_position, current_position, submitted_count, 
+                   target_count, status, messages, last_updated
+            FROM thread_state WHERE thread_id = ?
+        """, (thread_id,))
+        
+        row = cursor.fetchone()
+        if row:
+            return {
+                "thread_id": row[0],
+                "start_position": row[1],
+                "current_position": row[2],
+                "submitted_count": row[3],
+                "target_count": row[4],
+                "status": row[5],
+                "messages": json.loads(row[6]) if row[6] else [],
+                "last_updated": row[7]
+            }
+        return None
+    
+    def get_all_thread_states(self) -> List[Dict]:
+        """Get all thread states.
+        
+        Returns:
+            List of thread state dictionaries
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT thread_id, start_position, current_position, submitted_count, 
+                   target_count, status, messages, last_updated
+            FROM thread_state ORDER BY thread_id
+        """)
+        
+        states = []
+        for row in cursor.fetchall():
+            states.append({
+                "thread_id": row[0],
+                "start_position": row[1],
+                "current_position": row[2],
+                "submitted_count": row[3],
+                "target_count": row[4],
+                "status": row[5],
+                "messages": json.loads(row[6]) if row[6] else [],
+                "last_updated": row[7]
+            })
+        return states
+    
+    def clear_thread_states(self) -> None:
+        """Clear all thread states."""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM thread_state")
+        self.conn.commit()
+    
+    def set_session_metadata(self, key: str, value: str) -> None:
+        """Set session metadata.
+        
+        Args:
+            key: Metadata key
+            value: Metadata value
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO session_metadata (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        """, (key, value))
+        self.conn.commit()
+    
+    def get_session_metadata(self, key: str) -> Optional[str]:
+        """Get session metadata.
+        
+        Args:
+            key: Metadata key
+            
+        Returns:
+            Metadata value or None
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT value FROM session_metadata WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+    
+    def get_incomplete_threads(self) -> List[Dict]:
+        """Get all incomplete thread states (status != 'completed').
+        
+        Returns:
+            List of incomplete thread state dictionaries
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT thread_id, start_position, current_position, submitted_count, 
+                   target_count, status, messages, last_updated
+            FROM thread_state 
+            WHERE status != 'completed'
+            ORDER BY thread_id
+        """)
+        
+        states = []
+        for row in cursor.fetchall():
+            states.append({
+                "thread_id": row[0],
+                "start_position": row[1],
+                "current_position": row[2],
+                "submitted_count": row[3],
+                "target_count": row[4],
+                "status": row[5],
+                "messages": json.loads(row[6]) if row[6] else [],
+                "last_updated": row[7]
+            })
+        return states

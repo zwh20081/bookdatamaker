@@ -36,7 +36,6 @@ A powerful CLI tool for extracting text from documents using DeepSeek OCR and ge
 - 📊 **Multiple Formats**: JSONL, Parquet, CSV, JSON
 - 🌐 **Flexible Modes**: API or self-hosted for both stages
 - 📈 **Progress Tracking**: Real-time progress bars
-- ⚡ **Resume Support**: Continue interrupted sessions
 
 ## Quick Start
 
@@ -158,16 +157,37 @@ bookdatamaker extract book.pdf --mode local --device cuda:1 -o ./extracted
 bookdatamaker extract ./images/ --mode local -o ./extracted
 ```
 
-**Batch Size Guidelines:**
-- **12-16**: GPUs with 24GB+ VRAM
-- **8-12**: GPUs with 16GB+ VRAM (default: 8)
-- **4-8**: GPUs with 8-12GB VRAM
-- **1-4**: GPUs with <8GB VRAM
-
 **Device Options:**
 - `cuda` (default): Use default CUDA GPU
 - `cuda:0`, `cuda:1`, etc.: Use specific GPU
 - `cpu`: Use CPU (slower, no GPU required)
+- `xpu`: Use Intel XPU
+
+### Plain Text Mode (No OCR)
+
+For PDF with embedded text, skip OCR and extract text directly (much faster):
+
+```bash
+# Extract plain text from PDF without OCR
+bookdatamaker extract book.pdf --plain-text -o ./extracted
+```
+
+**Note**: EPUB files are **automatically extracted as plain text** (no OCR needed, no `--plain-text` flag required):
+
+```bash
+# EPUB always uses plain text extraction
+bookdatamaker extract book.epub -o ./extracted
+```
+
+**When to use `--plain-text` (for PDF):**
+- ✅ PDF with embedded text (e.g., born-digital documents)
+- ✅ Fast extraction without GPU/API requirements
+- ✅ Text-only documents
+
+**When NOT to use `--plain-text`:**
+- ❌ Scanned PDFs (images of text)
+- ❌ PDFs with complex layouts requiring OCR
+- ❌ Documents where text extraction quality is poor
 
 ### Output Structure
 
@@ -192,11 +212,41 @@ Generate Q&A datasets using parallel LLM threads with **page-based navigation**.
 
 ### Navigation Model
 
-The system now uses **page navigation** instead of paragraph navigation:
+The system uses **page navigation**:
 - LLM threads navigate through document pages
 - Tools available: `get_current_page`, `next_page`, `previous_page`, `jump_to_page`, `get_page_context`
 - Each thread starts at a specific page based on distribution
 - Threads can move forward/backward through pages to explore content
+
+### Checkpoint & Resume
+
+The generation process **automatically saves checkpoints** to the database:
+- Thread state is saved after each successful Q&A submission
+- If interrupted (Ctrl+C, crash, etc.), simply rerun the same command
+- You'll be prompted to resume from checkpoint or start fresh
+
+```bash
+# First run (interrupted at 50%)
+bookdatamaker generate ./extracted -d dataset.db --distribution "25,25,25,25"
+# ^C (interrupted)
+
+# Resume from checkpoint
+bookdatamaker generate ./extracted -d dataset.db --distribution "25,25,25,25"
+# ⚠️  Found 4 incomplete thread(s) in database:
+#   Thread 0: 8/20 pairs, last updated 2024-01-15 10:30:45
+#   Thread 1: 10/20 pairs, last updated 2024-01-15 10:30:48
+#   Thread 2: 12/20 pairs, last updated 2024-01-15 10:30:50
+#   Thread 3: 7/20 pairs, last updated 2024-01-15 10:30:43
+# 
+# Do you want to resume from checkpoint? [Y/n]: y
+# ✓ Resuming from checkpoint...
+```
+
+**Features:**
+- 💾 Automatic checkpoint after each Q&A pair submission
+- 🔄 Resume from last position in document
+- 💬 Preserves conversation history
+- 🎯 Tracks progress per thread
 
 ### Basic Usage
 
@@ -207,9 +257,6 @@ bookdatamaker generate ./extracted \
   --distribution "10,10,20,30,20,10" \
   --datasets-per-thread 20
 ```
-
-**Note**: The `generate` command now accepts the extracted directory (containing page_XXX/ subdirectories) instead of a combined text file.
-
 **Key Concept**: Thread count is determined by the number of comma-separated values in `--distribution`.
 
 ### API Mode Examples
@@ -249,13 +296,6 @@ bookdatamaker generate ./extracted \
   --distribution "10,10,20,30,20,10" \
   -d dataset.db
 ```
-
-**Benefits of vLLM Mode:**
-- No API costs
-- Full privacy (local processing)
-- Optimized inference
-- Thread-safe parallel processing
-- Automatic batching
 
 ### Custom Prompts
 
@@ -299,17 +339,6 @@ bookdatamaker export-dataset dataset.db -o output.csv -f csv
 # JSON with metadata
 bookdatamaker export-dataset dataset.db -o output.json -f json --include-metadata
 ```
-
-**Format Comparison:**
-
-| Format | Best For | Size | Load Speed |
-|--------|----------|------|------------|
-| Parquet | Data analysis, ML | Smallest | Fastest |
-| JSONL | Streaming, processing | Medium | Fast |
-| CSV | Excel, spreadsheets | Largest | Medium |
-| JSON | API responses | Large | Slow |
-
----
 
 ## Position Distribution
 
@@ -356,65 +385,6 @@ Thread 5: Start at 80%  → Page 80
 
 ---
 
-## Performance Tuning
-
-### Extraction (Stage 1)
-
-**Batch Size Optimization (Transformers):**
-
-```bash
-# Maximum speed (24GB+ VRAM) - uses transformers with DeepSeek-OCR
-bookdatamaker extract book.pdf --mode local --batch-size 16
-
-# Balanced (16GB VRAM) - transformers default batch size
-bookdatamaker extract book.pdf --mode local --batch-size 8
-
-# Conservative (<8GB VRAM) - smaller batches for limited VRAM
-bookdatamaker extract book.pdf --mode local --batch-size 4
-
-# Use CPU if no GPU available (slower)
-bookdatamaker extract book.pdf --mode local --device cpu --batch-size 2
-```
-
-**Multi-GPU Setup:**
-
-```bash
-# Use specific GPU in multi-GPU system
-bookdatamaker extract book.pdf --mode local --device cuda:0
-bookdatamaker extract book.pdf --mode local --device cuda:1
-
-# Run multiple processes on different GPUs simultaneously
-bookdatamaker extract book1.pdf --mode local --device cuda:0 &
-bookdatamaker extract book2.pdf --mode local --device cuda:1 &
-```
-
-### Generation (Stage 2)
-
-**Optimal Configurations:**
-
-```bash
-# Maximum throughput (multi-GPU, 12 threads)
-bookdatamaker generate text.txt --mode vllm \
-  --vllm-model-path meta-llama/Llama-3-70B \
-  --tensor-parallel-size 4 \
-  --distribution "5,5,10,10,15,15,15,15,5,5,2,3" \
-  --datasets-per-thread 50
-
-# Balanced (single GPU, 6 threads)
-bookdatamaker generate text.txt --mode vllm \
-  --vllm-model-path meta-llama/Llama-3-8B \
-  --distribution "10,10,20,30,20,10" \
-  --datasets-per-thread 20
-
-# Conservative (2 threads)
-bookdatamaker generate text.txt --mode vllm \
-  --vllm-model-path meta-llama/Llama-3-8B \
-  --distribution "50,50" \
-  --datasets-per-thread 10
-```
-
----
-
 ## Interactive Chat
 
 Chat with an LLM that can access your document through MCP tools. Perfect for exploring documents interactively or testing Q&A generation.
@@ -433,82 +403,6 @@ bookdatamaker chat ./extracted \
 # With custom database
 bookdatamaker chat ./extracted --db my_dataset.db
 ```
-
-### Example Interaction
-
-```
-📚 Document: ./extracted
-📊 Pages: 50
-🤖 Model: gpt-4
-
-You: What's on page 10?
-- `-f, --format`: Format: `jsonl`, `parquet`, `csv`, `json` (default: `parquet`)
-- `--include-metadata`: Include timestamps
-
-### Parameter Tables
-
-#### extract Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `input_path` | required | - | Input file or directory |
-| `--output-dir` | optional | `extracted_text` | Output directory |
-| `--mode` | optional | `api` | OCR mode: `api` or `local` |
-| `--batch-size` | optional | `8` | Batch size for local mode |
-| `--device` | optional | `cuda` | Torch device for local mode: `cuda`, `cuda:0`, `cpu` |
-| `--deepseek-api-key` | optional | env var | DeepSeek API key |
-| `--deepseek-api-url` | optional | `https://api.deepseek.com/v1` | DeepSeek API URL |
-| `--local-model-path` | optional | `deepseek-ai/DeepSeek-OCR` | Local model path |
-
-#### generate Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `extracted_dir` | required | - | Directory containing page subdirectories (page_XXX/) |
-| `--db` | optional | `dataset.db` | Database file path |
-| `--mode` | optional | `api` | LLM mode: `api` or `vllm` |
-| `--distribution` | optional | `10,10,20,30,20,10` | Position distribution (determines threads) |
-| `--datasets-per-thread` | optional | `10` | Target Q&A pairs per thread |
-| `--openai-api-key` | optional | env var | OpenAI API key |
-| `--openai-api-url` | optional | `https://api.openai.com/v1` | API URL |
-| `--model` | optional | `gpt-4` | Model name |
-| `--vllm-model-path` | optional | - | vLLM model path |
-| `--tensor-parallel-size` | optional | `1` | Number of GPUs |
-| `--custom-prompt` | optional | - | Additional instructions |
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**Problem: Threads not completing**
-- Reduce `--datasets-per-thread`
-- Check API rate limits
-- Verify API keys
-- Ensure document has enough content
-
-**Problem: Out of memory (OCR)**
-- Reduce `--batch-size`
-- Use `--device cpu` to run on CPU instead of GPU
-- Use API mode instead of local
-- Use specific GPU with `--device cuda:0` if you have multiple GPUs
-
-**Problem: Out of memory (Generation)**
-- Reduce thread count (fewer distribution values)
-- Use smaller model
-- Reduce `--tensor-parallel-size`
-
-**Problem: Low quality Q&A pairs**
-- Adjust distribution to focus on content-rich sections
-- Use higher-quality model (e.g., GPT-4)
-- Add specific `--custom-prompt` instructions
-- Check OCR quality
-
-**Problem: SQLite errors**
-- Ensure database path is writable
-- Don't modify database during generation
-- Delete and regenerate if corrupted
 
 ### Debug Mode
 

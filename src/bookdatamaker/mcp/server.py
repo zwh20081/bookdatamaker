@@ -580,12 +580,18 @@ class MCPServer:
                 return [TextContent(type="text", text=str(response))]
             
             elif name == "submit_dataset":
-                input_text = arguments["input"]
-                output_text = arguments["output"]
+                prompt_text = arguments.get("input", "").strip()
+                response_text = arguments.get("output", "").strip()
                 
+                # Validate that prompt and response are not empty
+                if not prompt_text or not response_text:
+                    response = {
+                        "status": "error",
+                        "message": "Both 'input' (question) and 'output' (answer) cannot be empty. Please provide valid content for both fields."
+                    }
                 # Save to database if dataset_manager is available
-                if self.dataset_manager:
-                    entry_id = self.dataset_manager.add_entry(input_text, output_text)
+                elif self.dataset_manager:
+                    entry_id = self.dataset_manager.add_entry(prompt_text, response_text)
                     total_entries = self.dataset_manager.count_entries()
                     
                     response = {
@@ -593,8 +599,8 @@ class MCPServer:
                         "message": f"Dataset entry saved to database. Total entries: {total_entries}",
                         "entry_id": entry_id,
                         "entry": {
-                            "input": input_text,
-                            "output": output_text
+                            "prompt": prompt_text,
+                            "response": response_text
                         }
                     }
                 else:

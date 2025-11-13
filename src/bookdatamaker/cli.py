@@ -65,6 +65,12 @@ def cli() -> None:
     default="cuda",
     help="Torch device for local mode (default: cuda). Examples: cuda, cuda:0, cpu",
 )
+@click.option(
+    "--plain-text",
+    is_flag=True,
+    default=False,
+    help="Extract plain text directly from PDF/EPUB without OCR (faster but may miss images)",
+)
 def extract(
     input_path: Path,
     output_dir: Path,
@@ -74,10 +80,11 @@ def extract(
     local_model_path: str,
     batch_size: int,
     device: str,
+    plain_text: bool,
 ) -> None:
-    """Extract text from images using DeepSeek OCR.
+    """Extract text from documents using OCR or plain text extraction.
 
-    INPUT_PATH: Path to image file or directory containing images
+    INPUT_PATH: Path to image file, PDF, EPUB, or directory containing files
     """
     if mode == "api" and not deepseek_api_key:
         click.echo("Error: DeepSeek API key required for API mode", err=True)
@@ -93,6 +100,7 @@ def extract(
             local_model_path,
             batch_size,
             device,
+            plain_text,
         )
     )
 
@@ -106,6 +114,7 @@ async def _extract_async(
     local_model_path: str,
     batch_size: int,
     device: str,
+    plain_text: bool,
 ) -> None:
     """Async extraction logic."""
     from bookdatamaker.utils import StatusIndicator
@@ -113,12 +122,22 @@ async def _extract_async(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with StatusIndicator() as status:
-        mode_label = "local transformers" if mode == "local" else "API"
+        # Determine if we need OCR based on file type and flags
+        is_epub = input_path.is_file() and input_path.suffix.lower() == ".epub"
+        needs_ocr = not plain_text and not is_epub
+        
+        if plain_text:
+            mode_label = "Plain Text"
+        elif is_epub:
+            mode_label = "EPUB (Plain Text)"
+        else:
+            mode_label = "local transformers" if mode == "local" else "API"
         status.print_info(f"Mode: {mode_label}")
-        if mode == "local":
+        if mode == "local" and needs_ocr:
             status.print_info(f"Device: {device}")
         status.print_info(f"Extracting text from: {input_path}")
 
+        # Skip OCR model loading for plain text and EPUB
         async with OCRExtractor(
             api_key=api_key,
             api_url=api_url,
@@ -126,16 +145,28 @@ async def _extract_async(
             local_model_path=local_model_path,
             batch_size=batch_size,
             device=device,
+            skip_model_load=not needs_ocr,
         ) as extractor:
             if input_path.is_file():
                 # Check if it's a document (PDF/EPUB) or image
                 if input_path.suffix.lower() in [".pdf", ".epub"]:
-                    # Document processing - force OCR mode
-                    status.print_info(f"Processing document: {input_path.suffix.upper()}")
-
-                    results = await extractor.extract_from_document(
-                        input_path, prefer_text=False, output_dir=output_dir
-                    )
+                    # EPUB always uses plain text extraction (no images to OCR)
+                    if input_path.suffix.lower() == ".epub":
+                        status.print_info(f"Processing EPUB (plain text mode)")
+                        results = await extractor.extract_from_document(
+                            input_path, prefer_text=True, output_dir=output_dir
+                        )
+                    # PDF: check plain_text flag
+                    elif plain_text:
+                        status.print_info(f"Processing PDF (plain text mode)")
+                        results = await extractor.extract_from_document(
+                            input_path, prefer_text=True, output_dir=output_dir
+                        )
+                    else:
+                        status.print_info(f"Processing PDF (OCR mode)")
+                        results = await extractor.extract_from_document(
+                            input_path, prefer_text=False, output_dir=output_dir
+                        )
 
                     if not results:
                         status.print_warning("No pages extracted")
@@ -173,9 +204,6 @@ async def _extract_async(
 
             # Save combined text - load all pages into memory with page markers
             all_files = sorted(output_dir.glob("*.txt"))
-            if not all_files:
-                status.print_warning("No text files found to combine")
-                return
 
             combined_content = []
 
@@ -257,6 +285,11 @@ async def _extract_async(
     "--custom-prompt",
     help="Additional custom instructions to append to system prompt",
 )
+@click.option(
+    "--tool-call-parser",
+    type=str,
+    help="Tool call parser name for vLLM mode (required when using vllm mode). Example: 'hermes', 'mistral'",
+)
 def generate(
     extracted_dir: Path,
     db: Path,
@@ -270,6 +303,7 @@ def generate(
     tensor_parallel_size: int,
     max_model_len: Optional[int],
     custom_prompt: Optional[str],
+    tool_call_parser: Optional[str],
 ) -> None:
     """Generate dataset using parallel LLM threads with MCP navigation.
 
@@ -290,9 +324,13 @@ def generate(
         click.echo("Error: OpenAI API key required for API mode", err=True)
         raise click.Abort()
     
-    if mode == "vllm" and not vllm_model_path:
-        click.echo("Error: --vllm-model-path required for vllm mode", err=True)
-        raise click.Abort()
+    if mode == "vllm":
+        if not vllm_model_path:
+            click.echo("Error: --vllm-model-path required for vllm mode", err=True)
+            raise click.Abort()
+        if not tool_call_parser:
+            click.echo("Error: --tool-call-parser required for vllm mode", err=True)
+            raise click.Abort()
 
     asyncio.run(
         _generate_async(
@@ -308,6 +346,7 @@ def generate(
             tensor_parallel_size,
             max_model_len,
             custom_prompt,
+            tool_call_parser,
         )
     )
 
@@ -325,9 +364,30 @@ async def _generate_async(
     tensor_parallel_size: int,
     max_model_len: Optional[int],
     custom_prompt: Optional[str],
+    tool_call_parser: Optional[str],
 ) -> None:
     """Async implementation of parallel dataset generation."""
     from bookdatamaker.llm.parallel_generator import ParallelDatasetGenerator
+    from bookdatamaker.dataset.dataset_manager import DatasetManager
+
+    # Check for incomplete session
+    if db.exists():
+        with DatasetManager(str(db)) as dataset_manager:
+            incomplete_threads = dataset_manager.get_incomplete_threads()
+            if incomplete_threads:
+                click.echo(f"\n⚠️  Found {len(incomplete_threads)} incomplete thread(s) in database:")
+                for thread in incomplete_threads:
+                    click.echo(f"  Thread {thread['thread_id']}: {thread['submitted_count']}/{thread['target_count']} pairs, last updated {thread['last_updated']}")
+                
+                if click.confirm("\nDo you want to resume from checkpoint?", default=True):
+                    click.echo("✓ Resuming from checkpoint...")
+                else:
+                    if click.confirm("Clear checkpoint data and start fresh?", default=False):
+                        dataset_manager.clear_thread_states()
+                        click.echo("✓ Checkpoint data cleared")
+                    else:
+                        click.echo("Aborted.")
+                        return
 
     click.echo(f"Loading pages from directory: {extracted_dir}")
     
@@ -352,6 +412,7 @@ async def _generate_async(
         tensor_parallel_size=tensor_parallel_size,
         max_model_len=max_model_len,
         custom_prompt=custom_prompt,
+        tool_call_parser=tool_call_parser,
     )
 
     click.echo(f"\nStarting {generator.num_threads} parallel threads")
@@ -363,7 +424,7 @@ async def _generate_async(
         total_generated = await generator.generate()
         click.echo(f"\n✓ Successfully generated {total_generated} Q&A pairs")
         click.echo(f"✓ Dataset saved to: {db}")
-        click.echo(f"\nTo export, use: bookdatamaker export-dataset {db} output.parquet")
+        click.echo(f"\nTo export, use: bookdatamaker export-dataset {db} -o output.parquet")
     except Exception as e:
         click.echo(f"\n✗ Error during generation: {e}", err=True)
         raise
@@ -711,10 +772,15 @@ Use the tools to access document content when needed."""
                     
                     # Execute tool
                     if function_name == "submit_dataset":
-                        input_text = function_args["input"]
-                        output_text = function_args["output"]
-                        entry_id = dataset_manager.add_entry(input_text, output_text)
-                        tool_result = f"Success! Q&A pair saved to database (ID: {entry_id})"
+                        input_text = function_args.get("input", "").strip()
+                        output_text = function_args.get("output", "").strip()
+                        
+                        # Validate that input and output are not empty
+                        if not input_text or not output_text:
+                            tool_result = "Error: Both 'input' (question) and 'output' (answer) cannot be empty. Please provide valid content for both fields."
+                        else:
+                            entry_id = dataset_manager.add_entry(input_text, output_text)
+                            tool_result = f"Success! Q&A pair saved to database (ID: {entry_id})"
                         
                     elif function_name == "exit":
                         console.print("\n[yellow]Assistant requested to exit. Goodbye![/yellow]")

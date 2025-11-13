@@ -83,6 +83,45 @@ class DocumentParser:
                 "PyMuPDF (fitz) is required for PDF parsing. "
                 "Install with: pip install pymupdf"
             )
+    
+    @staticmethod
+    def parse_pdf_text_and_images(pdf_path: Path, dpi: int = 200) -> List[Tuple[int, tuple[str, Image.Image]]]:
+        """Extract both text and images from PDF.
+
+        Args:
+            pdf_path: Path to PDF file
+            dpi: DPI for rendering images
+
+        Returns:
+            List of tuples (page_number, (text, image))
+        """
+        try:
+            import fitz  # PyMuPDF
+
+            doc = fitz.open(pdf_path)
+            pages = []
+
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                
+                # Extract text
+                text = page.get_text()
+                
+                # Render page as image
+                mat = fitz.Matrix(dpi / 72, dpi / 72)
+                pix = page.get_pixmap(matrix=mat)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                
+                pages.append((page_num + 1, (text, img)))
+
+            doc.close()
+            return pages
+
+        except ImportError:
+            raise ImportError(
+                "PyMuPDF (fitz) is required for PDF parsing. "
+                "Install with: pip install pymupdf"
+            )
 
     @staticmethod
     def parse_epub_to_images(epub_path: Path, width: int = 800) -> List[Tuple[int, Image.Image]]:
@@ -172,6 +211,61 @@ class DocumentParser:
                 "ebooklib and beautifulsoup4 are required for EPUB parsing. "
                 "Install with: pip install ebooklib beautifulsoup4"
             )
+    
+    @staticmethod
+    def parse_epub_text_and_images(epub_path: Path, width: int = 800) -> List[Tuple[int, tuple[str, Image.Image]]]:
+        """Extract both text and rendered images from EPUB.
+
+        Args:
+            epub_path: Path to EPUB file
+            width: Image width in pixels
+
+        Returns:
+            List of tuples (chapter_number, (text, image))
+        """
+        try:
+            import ebooklib
+            from ebooklib import epub
+            from bs4 import BeautifulSoup
+            from PIL import ImageDraw, ImageFont
+
+            book = epub.read_epub(epub_path)
+            pages = []
+            page_num = 1
+
+            for item in book.get_items():
+                if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                    # Extract text
+                    soup = BeautifulSoup(item.get_content(), "html.parser")
+                    text = soup.get_text()
+
+                    # Create simple text image for consistency
+                    img = Image.new("RGB", (width, 1000), color="white")
+                    draw = ImageDraw.Draw(img)
+
+                    try:
+                        font = ImageFont.truetype("arial.ttf", 16)
+                    except:
+                        font = ImageFont.load_default()
+
+                    # Draw text on image (simplified rendering)
+                    y_offset = 20
+                    for line in text[:2000].split("\n"):  # Limit text for rendering
+                        if y_offset > 950:
+                            break
+                        draw.text((20, y_offset), line[:80], fill="black", font=font)
+                        y_offset += 20
+
+                    pages.append((page_num, (text, img)))
+                    page_num += 1
+
+            return pages
+
+        except ImportError:
+            raise ImportError(
+                "ebooklib and beautifulsoup4 are required for EPUB parsing. "
+                "Install with: pip install ebooklib beautifulsoup4"
+            )
 
 
 def extract_document_pages(
@@ -191,7 +285,7 @@ def extract_document_pages(
     if parser.is_pdf(file_path):
         if prefer_text:
             try:
-                return parser.parse_pdf_text(file_path)
+                return parser.parse_pdf_text_and_images(file_path)
             except Exception:
                 return parser.parse_pdf_to_images(file_path)
         else:
@@ -199,7 +293,7 @@ def extract_document_pages(
 
     elif parser.is_epub(file_path):
         if prefer_text:
-            return parser.parse_epub_text(file_path)
+            return parser.parse_epub_text_and_images(file_path)
         else:
             return parser.parse_epub_to_images(file_path)
 

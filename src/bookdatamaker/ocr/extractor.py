@@ -22,6 +22,7 @@ class OCRExtractor:
         local_model_path: Optional[str] = None,
         batch_size: int = 8,
         device: str = "cuda",
+        skip_model_load: bool = False,
     ) -> None:
         """Initialize OCR extractor.
 
@@ -32,6 +33,7 @@ class OCRExtractor:
             local_model_path: Path to local model (for local mode)
             batch_size: Batch size for local transformers processing
             device: Torch device for local mode (default: "cuda")
+            skip_model_load: Skip loading OCR model (for plain text extraction)
         """
         self.mode = mode
         self.api_key = api_key
@@ -39,21 +41,26 @@ class OCRExtractor:
         self.local_model_path = local_model_path or "deepseek-ai/DeepSeek-OCR"
         self.batch_size = batch_size
         self.device = device
+        self.skip_model_load = skip_model_load
         self.llm = None
 
         if mode == "api":
-            if not api_key:
+            if not api_key and not skip_model_load:
                 raise ValueError("API key is required for API mode")
-            self.client = httpx.AsyncClient(
-                timeout=60.0,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
+            if not skip_model_load:
+                self.client = httpx.AsyncClient(
+                    timeout=60.0,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                )
+            else:
+                self.client = None
         else:
-            # Local mode - initialize transformers model
-            self._init_local_model()
+            # Local mode - initialize transformers model only if needed
+            if not skip_model_load:
+                self._init_local_model()
 
     async def __aenter__(self) -> "OCRExtractor":
         """Async context manager entry."""
@@ -432,8 +439,29 @@ class OCRExtractor:
         image_pages = []
         
         for page_num, content in pages:
-            if isinstance(content, str):
-                # Text already extracted
+            if isinstance(content, tuple) and len(content) == 2:
+                # Plain text mode: (text, image) tuple
+                text, image = content
+                if output_dir:
+                    page_dir = output_dir / f"page_{page_num:03d}"
+                    page_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Save text to result.mmd
+                    result_file = page_dir / "result.mmd"
+                    result_file.write_text(text, encoding="utf-8")
+                    
+                    # Save page image
+                    image_file = page_dir / f"page_{page_num:03d}.png"
+                    image.save(image_file)
+                
+                text_results.append((page_num, text))
+            elif isinstance(content, str):
+                # Text only (fallback for old code paths)
+                if output_dir:
+                    page_dir = output_dir / f"page_{page_num:03d}"
+                    page_dir.mkdir(parents=True, exist_ok=True)
+                    result_file = page_dir / "result.mmd"
+                    result_file.write_text(content, encoding="utf-8")
                 text_results.append((page_num, content))
             else:
                 # Image - need OCR
@@ -441,6 +469,11 @@ class OCRExtractor:
         
         # Process images
         if image_pages:
+            if self.skip_model_load:
+                raise RuntimeError(
+                    "OCR model not loaded. Cannot process images in plain text mode. "
+                    "Remove --plain-text flag or use OCR mode for image-based documents."
+                )
             if self.mode == "local":
                 # Batch process all images with transformers
                 image_results = await self._extract_batch_from_images(image_pages, output_dir)

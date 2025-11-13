@@ -19,6 +19,50 @@ from bookdatamaker.utils.page_manager import PageManager
 console = Console()
 
 
+def _serialize_messages(messages: List[dict]) -> List[dict]:
+    """Serialize messages to JSON-compatible format.
+    
+    Converts OpenAI tool_calls objects to dictionaries.
+    
+    Args:
+        messages: List of message dictionaries
+        
+    Returns:
+        JSON-serializable list of messages
+    """
+    serialized = []
+    for msg in messages:
+        msg_copy = msg.copy()
+        
+        # Convert tool_calls to dict if present
+        if "tool_calls" in msg_copy and msg_copy["tool_calls"]:
+            tool_calls_list = []
+            for tc in msg_copy["tool_calls"]:
+                # Check if already a dict (from restored state)
+                if isinstance(tc, dict):
+                    tool_calls_list.append(tc)
+                # Convert ChatCompletionMessageToolCall to dict
+                elif hasattr(tc, "model_dump"):
+                    tool_calls_list.append(tc.model_dump())
+                elif hasattr(tc, "dict"):
+                    tool_calls_list.append(tc.dict())
+                else:
+                    # Manual conversion for objects
+                    tool_calls_list.append({
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        }
+                    })
+            msg_copy["tool_calls"] = tool_calls_list
+        
+        serialized.append(msg_copy)
+    
+    return serialized
+
+
 class ParallelDatasetGenerator:
     """Generate datasets in parallel using multiple LLM threads."""
 
@@ -36,6 +80,7 @@ class ParallelDatasetGenerator:
         tensor_parallel_size: int = 1,
         max_model_len: Optional[int] = None,
         custom_prompt: Optional[str] = None,
+        tool_call_parser: Optional[str] = None,
     ) -> None:
         """Initialize parallel dataset generator.
 
@@ -52,6 +97,7 @@ class ParallelDatasetGenerator:
             tensor_parallel_size: Number of GPUs for tensor parallelism
             max_model_len: Maximum model context length (None = model's max)
             custom_prompt: Additional custom instructions for system prompt
+            tool_call_parser: Tool call parser name for vLLM (required for vLLM mode)
         """
         self.page_manager = page_manager
         self.db_path = db_path
@@ -66,6 +112,7 @@ class ParallelDatasetGenerator:
         self.tensor_parallel_size = tensor_parallel_size
         self.max_model_len = max_model_len
         self.custom_prompt = custom_prompt
+        self.tool_call_parser = tool_call_parser
         self.vllm_llm = None  # Will be initialized if using vLLM mode
         
         # Progress tracking
@@ -102,7 +149,12 @@ class ParallelDatasetGenerator:
             
             if tool_calls:
                 for tool_call in tool_calls:
-                    tqdm.write(f"[Thread {thread_id}] 🔧 Tool: {tool_call.function.name}")
+                    # Handle both object (from API) and dict (from restored state)
+                    if isinstance(tool_call, dict):
+                        tool_name = tool_call["function"]["name"]
+                    else:
+                        tool_name = tool_call.function.name
+                    tqdm.write(f"[Thread {thread_id}] 🔧 Tool: {tool_name}")
     
     def _log_tool_result(self, thread_id: int, tool_name: str, result: dict) -> None:
         """Log tool execution result.
@@ -114,7 +166,21 @@ class ParallelDatasetGenerator:
         """
         with self.log_lock:
             if tool_name == "submit_dataset":
-                tqdm.write(f"[Thread {thread_id}] ✓ Submitted Q&A pair: {result.get('message', '')}")
+                if "error" in result:
+                    tqdm.write(f"[Thread {thread_id}] ❌ Submit failed: {result['error']}")
+                else:
+                    count = result.get('count', '?')
+                    remaining = result.get('remaining', 0)
+                    question = result.get('question', '')
+                    answer = result.get('answer', '')
+                    
+                    # Truncate long text for display
+                    max_len = 60
+                    q_display = question[:max_len] + "..." if len(question) > max_len else question
+                    a_display = answer[:max_len] + "..." if len(answer) > max_len else answer
+                    
+                    tqdm.write(f"[Thread {thread_id}] ✓ #{count} Q: {q_display}")
+                    tqdm.write(f"[Thread {thread_id}]      A: {a_display} ({remaining} remaining)")
             elif tool_name == "exit":
                 if result.get("rejected"):
                     tqdm.write(f"[Thread {thread_id}] ❌ Exit rejected: {result.get('remaining', 0)} pairs remaining")
@@ -177,20 +243,42 @@ You have access to the following tools:
 - submit_dataset: Submit a question-answer pair to the dataset
 - exit: Exit the session after completing all submissions
 
+# Navigation Guidelines
+- Start at page {start_page} (your assigned starting position)
+- PREFER using next_page and previous_page to explore pages sequentially from your starting position
+- Use jump_to_page ONLY when necessary (e.g., to return to starting position or access a specific far-away page)
+- Focus on exploring the content near your starting position to ensure good coverage across threads
+
 # Workflow
 1. Use jump_to_page({start_page}) to start reading from page {start_page}
-2. Use next_page, previous_page, or get_page_context to explore the document
+2. Use next_page and previous_page to explore nearby pages sequentially
 3. When you find good content, generate a Q&A pair
 4. Use submit_dataset with input (question) and output (answer) to save it
 5. Repeat until you have submitted {self.datasets_per_thread} pairs
 6. Call exit when you reach {self.datasets_per_thread} submissions
 
-# Quality Guidelines
+# Quality Guidelines - CRITICAL
 - Questions should be clear and answerable from the document
 - Answers must be accurate and based on document content
 - Cover diverse topics and difficulty levels
+- Explore content near your assigned starting position (page {start_page})
 
-Remember: You MUST use the tools to accomplish this task. Start by calling jump_to_page to read the document."""
+## Content Adaptation Rules
+When generating Q&A pairs, adapt your approach based on content type:
+
+### For Specific Events/Cases (事件、案例、实例):
+- **Include MAXIMUM context**: Provide full background, timeline, participants, location, and outcome
+- **Be comprehensive**: Don't truncate - include all relevant details from the document
+- **Preserve specificity**: Keep names, dates, numbers, and specific circumstances
+- Example: If describing a historical event, include when, where, who, what happened, why, and consequences
+
+### For General Principles/Rules (通用规律、原理、概念):
+- **Generate MULTIPLE variations**: Create 2-4 different Q&A pairs exploring the same principle
+- **Different angles**: Ask about definition, application, examples, edge cases, comparison
+- **Vary difficulty**: Include basic explanation + advanced application scenarios
+- Example: For a scientific principle, create pairs for: definition, real-world application, related concepts, practical implications
+
+Remember: You MUST use the tools to accomplish this task. Start by calling jump_to_page({start_page}) to reach your starting position, then explore using next_page/previous_page."""
         
         # Append custom prompt if provided
         if self.custom_prompt:
@@ -337,16 +425,35 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
         """
         from tqdm import tqdm
         import threading
+        import json
+        
+        # Save session metadata
+        with DatasetManager(str(self.db_path)) as dm:
+            session_config = {
+                "mode": self.mode,
+                "distribution": ",".join(map(str, self.distribution)),
+                "datasets_per_thread": self.datasets_per_thread,
+                "num_threads": self.num_threads,
+            }
+            dm.set_session_metadata("config", json.dumps(session_config))
+            dm.set_session_metadata("openai_api_url", self.openai_api_url)
+            if self.model:
+                dm.set_session_metadata("model", self.model)
+            if self.vllm_model_path:
+                dm.set_session_metadata("vllm_model_path", self.vllm_model_path)
         
         # Initialize vLLM if needed (shared across threads)
         if self.mode == "vllm":
             print(f"Initializing vLLM with model: {self.vllm_model_path}")
+            print(f"Tool call parser: {self.tool_call_parser}")
             try:
                 from vllm import LLM, SamplingParams
                 # vLLM instance is thread-safe and can handle parallel requests
                 vllm_kwargs = {
                     "model": self.vllm_model_path,
                     "tensor_parallel_size": self.tensor_parallel_size,
+                    "enable_auto_tool_choice": True,  # Always enabled for tool calling
+                    "tool_call_parser": self.tool_call_parser,
                 }
                 if self.max_model_len is not None:
                     vllm_kwargs["max_model_len"] = self.max_model_len
@@ -359,6 +466,7 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                     max_tokens=2048,
                 )
                 print(f"✓ vLLM initialized with {self.tensor_parallel_size} GPU(s)")
+                print(f"✓ Auto tool choice enabled with parser: {self.tool_call_parser}")
             except ImportError:
                 print("Error: vLLM not installed. Install with: pip install vllm")
                 raise
@@ -462,19 +570,62 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                 client = OpenAI(
                     base_url=self.openai_api_url,
                     api_key=self.openai_api_key,
+                    timeout=600.0,  # 600 seconds timeout for long-running requests
                 )
                 
-                # Initialize dataset manager and set current position
+                # Initialize dataset manager
                 dataset_manager = DatasetManager(str(self.db_path))
                 page_manager = self.page_manager  # Use the page_manager from class instance
-                current_position = start_page
                 
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Please start the task. First, call jump_to_page to navigate to page {start_page}, then begin generating {self.datasets_per_thread} Q&A pairs."}
-                ]
+                # Try to restore from checkpoint
+                saved_state = dataset_manager.get_thread_state(thread_id)
+                
+                if saved_state and saved_state["status"] != "completed":
+                    # Resume from checkpoint
+                    current_position = saved_state["current_position"]
+                    submitted_count = saved_state["submitted_count"]
+                    messages = saved_state["messages"]
+                    
+                    with self.log_lock:
+                        tqdm.write(f"[Thread {thread_id}] 🔄 Resuming from checkpoint: {submitted_count}/{self.datasets_per_thread} pairs completed, at page {current_position}")
+                    
+                    # Update progress bar to reflect already completed work
+                    self._update_progress(submitted_count)
+                    
+                    # Jump to saved position
+                    page_manager.jump_to_page(current_position)
+                    
+                    # Add resume message
+                    resume_msg = f"Session resumed. You have submitted {submitted_count}/{self.datasets_per_thread} Q&A pairs so far. You need {self.datasets_per_thread - submitted_count} more. Continue from current position (page {current_position})."
+                    if self.custom_prompt:
+                        resume_msg += f"\n\nREMINDER: {self.custom_prompt}"
+                    messages.append({
+                        "role": "user",
+                        "content": resume_msg
+                    })
+                else:
+                    # Start fresh
+                    current_position = start_page
+                    start_msg = f"Please start the task. First, call jump_to_page to navigate to page {start_page}, then begin generating {self.datasets_per_thread} Q&A pairs."
+                    if self.custom_prompt:
+                        start_msg += f"\n\nIMPORTANT: {self.custom_prompt}"
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": start_msg}
+                    ]
+                    submitted_count = 0
+                    
+                    # Save initial state
+                    dataset_manager.save_thread_state(
+                        thread_id=thread_id,
+                        start_position=start_page,
+                        current_position=current_position,
+                        submitted_count=0,
+                        target_count=self.datasets_per_thread,
+                        status="running",
+                        messages=_serialize_messages(messages)
+                    )
 
-                submitted_count = 0
                 max_iterations = self.datasets_per_thread * 20  # Safety limit
                 tools = self._get_mcp_tools()
                 no_tool_call_count = 0  # Track consecutive responses without tool calls
@@ -518,31 +669,72 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                             # Process each tool call
                             for tool_call in message.tool_calls:
                                 import json
-                                function_name = tool_call.function.name
-                                function_args = json.loads(tool_call.function.arguments)
+                                
+                                # Handle both object (from API) and dict (from restored state)
+                                if isinstance(tool_call, dict):
+                                    function_name = tool_call["function"]["name"]
+                                    function_args = json.loads(tool_call["function"]["arguments"])
+                                    tool_call_id = tool_call["id"]
+                                else:
+                                    function_name = tool_call.function.name
+                                    function_args = json.loads(tool_call.function.arguments)
+                                    tool_call_id = tool_call.id
                                 
                                 # Execute tool and get result
                                 if function_name == "submit_dataset":
-                                    input_text = function_args["input"]
-                                    output_text = function_args["output"]
-                                    entry_id = dataset_manager.add_entry(input_text, output_text)
-                                    submitted_count += 1
-                                    self._update_progress(1)
+                                    prompt_text = function_args.get("input", "").strip()
+                                    response_text = function_args.get("output", "").strip()
                                     
-                                    remaining = self.datasets_per_thread - submitted_count
-                                    if remaining > 0:
-                                        tool_result = f"Success! Submitted Q&A pair {submitted_count}/{self.datasets_per_thread}. You need {remaining} more pairs. Continue exploring and generating."
+                                    # Validate that prompt and response are not empty
+                                    if not prompt_text or not response_text:
+                                        tool_result = "Error: Both 'input' (question) and 'output' (answer) cannot be empty. Please provide valid content for both fields."
+                                        self._log_tool_result(thread_id, function_name, {"error": "Empty input or output"})
                                     else:
-                                        tool_result = f"Success! Submitted Q&A pair {submitted_count}/{self.datasets_per_thread}. Target reached! Now call exit() to complete the task."
-                                    
-                                    self._log_tool_result(thread_id, function_name, {"count": submitted_count, "remaining": remaining})
+                                        entry_id = dataset_manager.add_entry(prompt_text, response_text)
+                                        submitted_count += 1
+                                        self._update_progress(1)
+                                        
+                                        # Save checkpoint after each successful submission
+                                        dataset_manager.save_thread_state(
+                                            thread_id=thread_id,
+                                            start_position=start_page,
+                                            current_position=current_position,
+                                            submitted_count=submitted_count,
+                                            target_count=self.datasets_per_thread,
+                                            status="running",
+                                            messages=_serialize_messages(messages)
+                                        )
+                                        
+                                        remaining = self.datasets_per_thread - submitted_count
+                                        if remaining > 0:
+                                            tool_result = f"Success! Submitted Q&A pair {submitted_count}/{self.datasets_per_thread}. You need {remaining} more pairs. Continue exploring and generating."
+                                            if self.custom_prompt:
+                                                tool_result += f"\n\nREMINDER: {self.custom_prompt}"
+                                        else:
+                                            tool_result = f"Success! Submitted Q&A pair {submitted_count}/{self.datasets_per_thread}. Target reached! Now call exit() to complete the task."
+                                        
+                                        self._log_tool_result(thread_id, function_name, {
+                                            "count": submitted_count, 
+                                            "remaining": remaining,
+                                            "question": prompt_text,
+                                            "answer": response_text
+                                        })
                                     
                                 elif function_name == "exit":
                                     reason = function_args.get("reason", "Task completed")
                                     
                                     # Check if target is reached
                                     if submitted_count >= self.datasets_per_thread:
-                                        # Target reached - allow exit
+                                        # Target reached - mark as completed and exit
+                                        dataset_manager.save_thread_state(
+                                            thread_id=thread_id,
+                                            start_position=start_page,
+                                            current_position=current_position,
+                                            submitted_count=submitted_count,
+                                            target_count=self.datasets_per_thread,
+                                            status="completed",
+                                            messages=_serialize_messages(messages)
+                                        )
                                         self._log_tool_result(thread_id, function_name, {"reason": reason, "success": True})
                                         return {
                                             "thread_id": thread_id,
@@ -564,6 +756,17 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                         current_position = result["page_number"]
                                         tool_result = f"Page {result['page_number']} (of {result['total_pages']}):\n{result['content']}"
                                         self._log_tool_result(thread_id, function_name, {"page": result['page_number']})
+                                        
+                                        # Save position
+                                        dataset_manager.save_thread_state(
+                                            thread_id=thread_id,
+                                            start_position=start_page,
+                                            current_position=current_position,
+                                            submitted_count=submitted_count,
+                                            target_count=self.datasets_per_thread,
+                                            status="running",
+                                            messages=_serialize_messages(messages)
+                                        )
                                     else:
                                         tool_result = f"Error: Could not get current page"
                                         self._log_tool_result(thread_id, function_name, {"error": "Could not get current page"})
@@ -576,6 +779,17 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                         result = page_manager.get_page_info()
                                         tool_result = f"Page {page_num} (of {result['total_pages']}):\n{content}"
                                         self._log_tool_result(thread_id, function_name, {"page": page_num})
+                                        
+                                        # Save position after navigation
+                                        dataset_manager.save_thread_state(
+                                            thread_id=thread_id,
+                                            start_position=start_page,
+                                            current_position=current_position,
+                                            submitted_count=submitted_count,
+                                            target_count=self.datasets_per_thread,
+                                            status="running",
+                                            messages=_serialize_messages(messages)
+                                        )
                                     else:
                                         tool_result = f"Error: Page {page_num} not found"
                                         self._log_tool_result(thread_id, function_name, {"error": f"Page {page_num} not found"})
@@ -588,6 +802,17 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                         current_position = result["page_number"]
                                         tool_result = f"Moved to page {result['page_number']} (of {result['total_pages']}):\n{content}"
                                         self._log_tool_result(thread_id, function_name, {"to": result['page_number'], "steps": steps})
+                                        
+                                        # Save position after navigation
+                                        dataset_manager.save_thread_state(
+                                            thread_id=thread_id,
+                                            start_position=start_page,
+                                            current_position=current_position,
+                                            submitted_count=submitted_count,
+                                            target_count=self.datasets_per_thread,
+                                            status="running",
+                                            messages=_serialize_messages(messages)
+                                        )
                                     else:
                                         tool_result = f"Error: Could not move to next page"
                                         self._log_tool_result(thread_id, function_name, {"error": "Could not move forward"})
@@ -600,6 +825,17 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                         current_position = result["page_number"]
                                         tool_result = f"Moved to page {result['page_number']} (of {result['total_pages']}):\n{content}"
                                         self._log_tool_result(thread_id, function_name, {"to": result['page_number'], "steps": steps})
+                                        
+                                        # Save position after navigation
+                                        dataset_manager.save_thread_state(
+                                            thread_id=thread_id,
+                                            start_position=start_page,
+                                            current_position=current_position,
+                                            submitted_count=submitted_count,
+                                            target_count=self.datasets_per_thread,
+                                            status="running",
+                                            messages=_serialize_messages(messages)
+                                        )
                                     else:
                                         tool_result = f"Error: Could not move to previous page"
                                         self._log_tool_result(thread_id, function_name, {"error": "Could not move backward"})
@@ -627,7 +863,7 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                 # Add tool result to messages - use string format for better model understanding
                                 messages.append({
                                     "role": "tool",
-                                    "tool_call_id": tool_call.id,
+                                    "tool_call_id": tool_call_id,
                                     "content": str(tool_result)
                                 })
                         
@@ -639,6 +875,9 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                 # After 2 consecutive responses without tools, remind
                                 remaining = self.datasets_per_thread - submitted_count
                                 reminder = f"You haven't used any tools. You still need to submit {remaining} more Q&A pairs. Please use get_paragraph, move_forward, or move_backward to explore the document, then submit_dataset to save Q&A pairs. Call exit() when you reach {self.datasets_per_thread} submissions."
+                                
+                                if self.custom_prompt:
+                                    reminder += f"\n\nREMINDER: {self.custom_prompt}"
                                 
                                 with self.log_lock:
                                     tqdm.write(f"[Thread {thread_id}] ⚠️  Reminding LLM to use tools ({remaining} pairs remaining)")
@@ -653,9 +892,12 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                         with self.log_lock:
                             tqdm.write(f"[Thread {thread_id}] ❌ Error: {str(e)[:100]}")
                         # Add error message to continue conversation
+                        error_msg = f"Error occurred: {e}. Please continue with the task."
+                        if self.custom_prompt:
+                            error_msg += f"\n\nREMINDER: {self.custom_prompt}"
                         messages.append({
                             "role": "user",
-                            "content": f"Error occurred: {e}. Please continue with the task."
+                            "content": error_msg
                         })
                         continue
 
