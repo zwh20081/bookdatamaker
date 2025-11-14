@@ -12,6 +12,7 @@ tqdm
 PyMuPDF
 ebooklib
 beautifulsoup4
+rapidfuzz
 
 # Optional: for self-hosted models
 # transformers==4.46.3

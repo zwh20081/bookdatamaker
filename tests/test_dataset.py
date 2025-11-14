@@ -3,7 +3,12 @@
 import pytest
 from pathlib import Path
 import tempfile
-from bookdatamaker.dataset import DatasetBuilder, create_standard_schema
+from bookdatamaker.dataset import (
+    DatasetBuilder,
+    DatasetManager,
+    DuplicateEntryError,
+    create_standard_schema,
+)
 
 
 class TestDatasetBuilder:
@@ -117,3 +122,22 @@ class TestDatasetBuilder:
         assert "output" in field_names
         assert "model" in field_names
         assert "tokens_used" in field_names
+
+
+
+
+def test_dataset_manager_rejects_duplicates(tmp_path):
+    """Ensure duplicate submissions are blocked when similarity exceeds threshold."""
+    db_path = tmp_path / "dataset.db"
+    with DatasetManager(str(db_path)) as manager:
+        manager.add_entry("What is AI?", "Artificial intelligence is the study of intelligent agents.")
+
+        with pytest.raises(DuplicateEntryError) as excinfo:
+            manager.add_entry("What is AI?", "Artificial intelligence is the study of intelligent agents.")
+
+        message = str(excinfo.value)
+        assert "Duplicate entry detected" in message
+        assert excinfo.value.existing_entry["id"] == 1
+
+        manager.add_entry("Describe machine learning", "Machine learning uses data to train predictive models.")
+        assert manager.count_entries() == 2

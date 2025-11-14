@@ -1,15 +1,16 @@
 """MCP server for paragraph and line/column navigation."""
 
-from typing import Any, Dict, List, Optional
+import json
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-try:
+if TYPE_CHECKING:
     from ..utils.page_manager import PageManager
-except ImportError:
-    PageManager = None
+else:
+    PageManager = Any
 
 
 class ParagraphNavigator:
@@ -109,6 +110,8 @@ class MCPServer:
         self.db_path = db_path
         self.dataset_manager = None
         self.should_exit = False
+        self.page_submission_counts: Dict[int, int] = {}
+        self.last_accessed_page: Optional[int] = None
         
         # Initialize dataset manager if db_path provided
         if self.db_path:
@@ -117,6 +120,9 @@ class MCPServer:
                 self.dataset_manager = DatasetManager(self.db_path)
             except ImportError:
                 print("Warning: Could not import DatasetManager")
+
+        # Initialize submission counters
+        self._refresh_page_submission_state()
         
         self.server = Server("document-navigator")
         self._setup_tools()
@@ -150,8 +156,70 @@ class MCPServer:
         
         if additional_info:
             response.update(additional_info)
+
+        if page_number is not None and self.page_manager:
+            response["page_submission_count"] = self.page_submission_counts.get(page_number, 0)
         
         return response
+
+    def _record_page_access(self, page_numbers: List[Optional[int]]) -> None:
+        """Record latest accessed page without mutating submission counts."""
+        for page_num in page_numbers:
+            if page_num is not None:
+                self.last_accessed_page = page_num
+                break
+
+    def _build_page_access_summary(self) -> Dict[str, Any]:
+        """Build summary of page access statistics."""
+        if not (self.page_manager and self.dataset_manager):
+            return {
+                "total_pages": 0,
+                "total_submissions": 0,
+                "page_submission_counts": {},
+            }
+        self._refresh_page_submission_state()
+
+        counts = {
+            page_num: self.page_submission_counts.get(page_num, 0)
+            for page_num in getattr(self.page_manager, "page_numbers", [])
+        }
+        sorted_pages = sorted(counts.items(), key=lambda item: (item[1], item[0]))
+        total_submissions = sum(counts.values())
+
+        least_viewed = [page for page, _ in sorted_pages[:5]] if sorted_pages else []
+        most_viewed = [page for page, _ in sorted_pages[-5:]] if sorted_pages else []
+
+        average_access = total_submissions / len(counts) if counts else 0.0
+
+        return {
+            "total_pages": len(counts),
+            "total_submissions": total_submissions,
+            "average_submissions_per_page": average_access,
+            "page_submission_counts": counts,
+            "least_submitted_pages": least_viewed,
+            "most_submitted_pages": most_viewed,
+            "last_submission_page": self.last_accessed_page,
+            "recommended_pages": [page for page in least_viewed if counts.get(page, 0) <= average_access],
+        }
+
+    def _refresh_page_submission_state(self) -> None:
+        """Reload submission counts from dataset manager."""
+        if not self.dataset_manager:
+            return
+
+        if self.page_manager:
+            for page_num in getattr(self.page_manager, "page_numbers", []):
+                self.page_submission_counts.setdefault(page_num, 0)
+
+        counts = self.dataset_manager.get_page_submission_counts()
+        self.page_submission_counts.update(counts)
+
+        last_page_value = self.dataset_manager.get_session_metadata("last_submission_page")
+        if last_page_value is not None:
+            try:
+                self.last_accessed_page = int(last_page_value)
+            except ValueError:
+                self.last_accessed_page = None
 
     def _setup_tools(self) -> None:
         """Set up MCP tools."""
@@ -344,6 +412,20 @@ class MCPServer:
                         },
                     ),
                     Tool(
+                        name="get_page_access_summary",
+                        description="Get global page access statistics so you can focus on under-explored pages",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "limit": {
+                                    "type": "integer",
+                                    "description": "Optional limit for how many least-viewed pages to highlight",
+                                    "default": 5,
+                                }
+                            },
+                        },
+                    ),
+                    Tool(
                         name="get_line",
                         description="Get content of a specific line by line number",
                         inputSchema={
@@ -479,6 +561,7 @@ class MCPServer:
                     if para_info:
                         line_num = para_info["start_line"]
                         page_num = para_info["page_number"]
+                        self._record_page_access([page_num])
                 
                 response = self._format_response(
                     content=content,
@@ -500,6 +583,7 @@ class MCPServer:
                     if para_info:
                         line_num = para_info["start_line"]
                         page_num = para_info["page_number"]
+                        self._record_page_access([page_num])
                 
                 response = self._format_response(
                     content=content,
@@ -521,6 +605,7 @@ class MCPServer:
                     if para_info:
                         line_num = para_info["start_line"]
                         page_num = para_info["page_number"]
+                        self._record_page_access([page_num])
                 
                 response = self._format_response(
                     content=content,
@@ -544,6 +629,7 @@ class MCPServer:
                     if para_info:
                         line_num = para_info["start_line"]
                         page_num = para_info["page_number"]
+                        self._record_page_access([page_num])
                 
                 response = self._format_response(
                     content=content,
@@ -570,6 +656,7 @@ class MCPServer:
                     if para_info:
                         line_num = para_info["start_line"]
                         page_num = para_info["page_number"]
+                        self._record_page_access([page_num])
                 
                 response = self._format_response(
                     content=content,
@@ -633,19 +720,34 @@ class MCPServer:
 
             # Page-based navigation tools
             elif name == "get_current_page" and self.page_manager:
+                self._refresh_page_submission_state()
                 page_info = self.page_manager.get_page_info()
+                page_num = page_info.get("page_number") if isinstance(page_info, dict) else None
+                self._record_page_access([page_num])
+                if isinstance(page_info, dict) and page_num is not None:
+                    page_info["submission_count"] = self.page_submission_counts.get(page_num, 0)
                 return [TextContent(type="text", text=str(page_info))]
 
             elif name == "next_page" and self.page_manager:
                 steps = arguments.get("steps", 1)
                 self.page_manager.next_page(steps)
+                self._refresh_page_submission_state()
                 page_info = self.page_manager.get_page_info()
+                page_num = page_info.get("page_number") if isinstance(page_info, dict) else None
+                self._record_page_access([page_num])
+                if isinstance(page_info, dict) and page_num is not None:
+                    page_info["submission_count"] = self.page_submission_counts.get(page_num, 0)
                 return [TextContent(type="text", text=str(page_info))]
 
             elif name == "previous_page" and self.page_manager:
                 steps = arguments.get("steps", 1)
                 self.page_manager.previous_page(steps)
+                self._refresh_page_submission_state()
                 page_info = self.page_manager.get_page_info()
+                page_num = page_info.get("page_number") if isinstance(page_info, dict) else None
+                self._record_page_access([page_num])
+                if isinstance(page_info, dict) and page_num is not None:
+                    page_info["submission_count"] = self.page_submission_counts.get(page_num, 0)
                 return [TextContent(type="text", text=str(page_info))]
 
             elif name == "jump_to_page" and self.page_manager:
@@ -653,20 +755,50 @@ class MCPServer:
                 content = self.page_manager.jump_to_page(page_number)
                 if content is None:
                     return [TextContent(type="text", text=f"Page {page_number} not found")]
+                self._refresh_page_submission_state()
                 page_info = self.page_manager.get_page_info()
+                page_num = page_info.get("page_number") if isinstance(page_info, dict) else None
+                self._record_page_access([page_num])
+                if isinstance(page_info, dict) and page_num is not None:
+                    page_info["submission_count"] = self.page_submission_counts.get(page_num, 0)
                 return [TextContent(type="text", text=str(page_info))]
 
             elif name == "get_page_context" and self.page_manager:
                 before = arguments.get("before", 1)
                 after = arguments.get("after", 1)
                 current_page = self.page_manager.get_current_page_number()
+                self._refresh_page_submission_state()
                 context = self.page_manager.get_context(current_page, before, after)
+                pages_viewed = {
+                    page
+                    for page in [context.get("current_page")]
+                    if page is not None
+                }
+                pages_viewed.update(context.get("previous_pages", {}).keys())
+                pages_viewed.update(context.get("next_pages", {}).keys())
+                pages_list = list(pages_viewed)
+                self._record_page_access(pages_list)
+                context["submission_counts"] = {
+                    page: self.page_submission_counts.get(page, 0)
+                    for page in pages_list
+                }
                 return [TextContent(type="text", text=str(context))]
 
             # Line/column navigation tools
             elif name == "get_document_stats" and self.page_manager:
                 stats = self.page_manager.get_statistics()
                 return [TextContent(type="text", text=str(stats))]
+
+            elif name == "get_page_access_summary" and self.page_manager:
+                summary = self._build_page_access_summary()
+                limit = arguments.get("limit", 5)
+                # Highlight least-viewed pages up to provided limit
+                least_viewed = sorted(
+                    summary.get("page_submission_counts", {}).items(),
+                    key=lambda item: (item[1], item[0])
+                )
+                summary["least_submitted_pages"] = [page for page, _ in least_viewed[:limit]]
+                return [TextContent(type="text", text=json.dumps(summary, ensure_ascii=False, indent=2))]
 
             elif name == "get_line" and self.page_manager:
                 line_num = arguments["line_number"]
@@ -677,6 +809,8 @@ class MCPServer:
                 # Get page and paragraph info
                 page_num, _ = self.page_manager.line_to_page.get(line_num, (None, None))
                 para_num = self.page_manager.get_paragraph_number(line_num)
+                self._refresh_page_submission_state()
+                self._record_page_access([page_num])
                 
                 response = self._format_response(
                     content=content,
@@ -695,6 +829,8 @@ class MCPServer:
                 # Get page and paragraph for start line
                 page_num, _ = self.page_manager.line_to_page.get(start, (None, None))
                 para_num = self.page_manager.get_paragraph_number(start)
+                self._refresh_page_submission_state()
+                self._record_page_access([page_num])
                 
                 response = self._format_response(
                     content=content,
@@ -720,6 +856,8 @@ class MCPServer:
                 
                 # Already has line_number, page_number in context
                 para_num = self.page_manager.get_paragraph_number(line_num)
+                self._refresh_page_submission_state()
+                self._record_page_access([context.get("page_number")])
                 
                 response = self._format_response(
                     content=context["content"],
@@ -746,6 +884,8 @@ class MCPServer:
                 
                 page_num, _ = self.page_manager.line_to_page.get(line_num, (None, None))
                 para_num = self.page_manager.get_paragraph_number(line_num)
+                self._refresh_page_submission_state()
+                self._record_page_access([page_num])
                 
                 response = self._format_response(
                     content=result,
@@ -775,9 +915,12 @@ class MCPServer:
 
             elif name == "get_page_info" and self.page_manager:
                 page_num = arguments["page_number"]
+                self._refresh_page_submission_state()
                 info = self.page_manager.get_page_line_info(page_num)
                 if info is None:
                     return [TextContent(type="text", text=f"Page {page_num} not found")]
+                self._record_page_access([page_num])
+                info["submission_count"] = self.page_submission_counts.get(page_num, 0)
                 return [TextContent(type="text", text=str(info))]
 
             else:

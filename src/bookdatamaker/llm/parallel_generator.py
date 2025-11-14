@@ -1,6 +1,7 @@
 """Parallel dataset generation using multiple LLM threads."""
 
 import asyncio
+import json
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +14,7 @@ from tqdm import tqdm
 from rich.console import Console
 from rich.panel import Panel
 
-from bookdatamaker.dataset.dataset_manager import DatasetManager
+from bookdatamaker.dataset.dataset_manager import DatasetManager, DuplicateEntryError
 from bookdatamaker.utils.page_manager import PageManager
 
 console = Console()
@@ -168,6 +169,14 @@ class ParallelDatasetGenerator:
             if tool_name == "submit_dataset":
                 if "error" in result:
                     tqdm.write(f"[Thread {thread_id}] ❌ Submit failed: {result['error']}")
+                    question = result.get("question")
+                    answer = result.get("answer")
+                    if question:
+                        short_q = question[:60] + "..." if len(question) > 60 else question
+                        tqdm.write(f"[Thread {thread_id}]    Rejected Q: {short_q}")
+                    if answer:
+                        short_a = answer[:60] + "..." if len(answer) > 60 else answer
+                        tqdm.write(f"[Thread {thread_id}]    Rejected A: {short_a}")
                 else:
                     count = result.get('count', '?')
                     remaining = result.get('remaining', 0)
@@ -242,6 +251,7 @@ You have access to the following tools:
 - get_page_context: Get current page with surrounding pages for context
 - submit_dataset: Submit a question-answer pair to the dataset
 - exit: Exit the session after completing all submissions
+- get_page_access_summary: View global coverage stats and find pages with the fewest visits
 
 # Navigation Guidelines
 - Start at page {start_page} (your assigned starting position)
@@ -277,6 +287,15 @@ When generating Q&A pairs, adapt your approach based on content type:
 - **Different angles**: Ask about definition, application, examples, edge cases, comparison
 - **Vary difficulty**: Include basic explanation + advanced application scenarios
 - Example: For a scientific principle, create pairs for: definition, real-world application, related concepts, practical implications
+
+# Coverage Guidelines
+- Use get_page_access_summary regularly to monitor which pages are under-explored
+- Prioritize reading and extracting from pages with the lowest access counts whenever feasible
+- Avoid repeatedly revisiting heavily accessed pages unless extra context is required
+
+# Content Restrictions
+- Do not create question-answer pairs based on publication metadata such as the book title, author, publisher, ISBN, edition details, or copyright pages
+- 如果页面主要是书本的出版信息、标题、作者等内容，请不要提交问答，直接调用 next_page 跳过
 
 Remember: You MUST use the tools to accomplish this task. Start by calling jump_to_page({start_page}) to reach your starting position, then explore using next_page/previous_page."""
         
@@ -690,35 +709,86 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                         tool_result = "Error: Both 'input' (question) and 'output' (answer) cannot be empty. Please provide valid content for both fields."
                                         self._log_tool_result(thread_id, function_name, {"error": "Empty input or output"})
                                     else:
-                                        entry_id = dataset_manager.add_entry(prompt_text, completion_text)
-                                        submitted_count += 1
-                                        self._update_progress(1)
-                                        
-                                        # Save checkpoint after each successful submission
-                                        dataset_manager.save_thread_state(
-                                            thread_id=thread_id,
-                                            start_position=start_page,
-                                            current_position=current_position,
-                                            submitted_count=submitted_count,
-                                            target_count=self.datasets_per_thread,
-                                            status="running",
-                                            messages=_serialize_messages(messages)
-                                        )
-                                        
-                                        remaining = self.datasets_per_thread - submitted_count
-                                        if remaining > 0:
-                                            tool_result = f"Success! Submitted Q&A pair {submitted_count}/{self.datasets_per_thread}. You need {remaining} more pairs. Continue exploring and generating."
-                                            if self.custom_prompt:
-                                                tool_result += f"\n\nREMINDER: {self.custom_prompt}"
+                                        try:
+                                            entry_id = dataset_manager.add_entry(prompt_text, completion_text)
+                                        except DuplicateEntryError as duplicate_error:
+                                            similarity_pct = duplicate_error.similarity
+                                            existing_id = duplicate_error.existing_entry["id"]
+                                            tool_result = (
+                                                "Duplicate submission rejected. The proposed Q&A pair "
+                                                f"matches existing entry #{existing_id} with {similarity_pct:.1f}% similarity. "
+                                                "Please explore different content (consider using next_page) before submitting."
+                                                f"\nRejected question: {prompt_text}"
+                                                f"\nRejected answer: {completion_text}"
+                                            )
+                                            self._log_tool_result(thread_id, function_name, {
+                                                "error": f"Duplicate entry #{existing_id} ({similarity_pct:.1f}%)",
+                                                "existing_id": existing_id,
+                                                "similarity": similarity_pct,
+                                                "question": prompt_text,
+                                                "answer": completion_text,
+                                            })
                                         else:
-                                            tool_result = f"Success! Submitted Q&A pair {submitted_count}/{self.datasets_per_thread}. Target reached! Now call exit() to complete the task."
-                                        
-                                        self._log_tool_result(thread_id, function_name, {
-                                            "count": submitted_count, 
-                                            "remaining": remaining,
-                                            "question": prompt_text,
-                                            "answer": completion_text
-                                        })
+                                            submitted_count += 1
+                                            self._update_progress(1)
+
+                                            page_number = current_position or (
+                                                page_manager.get_current_page_number() if page_manager else None
+                                            )
+                                            submission_counts = {}
+                                            if page_number is not None:
+                                                submission_counts = dataset_manager.record_page_submission(page_number)
+
+                                            # Save checkpoint after each successful submission
+                                            dataset_manager.save_thread_state(
+                                                thread_id=thread_id,
+                                                start_position=start_page,
+                                                current_position=current_position,
+                                                submitted_count=submitted_count,
+                                                target_count=self.datasets_per_thread,
+                                                status="running",
+                                                messages=_serialize_messages(messages)
+                                            )
+                                            
+                                            remaining = self.datasets_per_thread - submitted_count
+                                            if remaining > 0:
+                                                tool_result = f"Success! Submitted Q&A pair {submitted_count}/{self.datasets_per_thread}. You need {remaining} more pairs. Continue exploring and generating."
+                                                if self.custom_prompt:
+                                                    tool_result += f"\n\nREMINDER: {self.custom_prompt}"
+                                            else:
+                                                tool_result = f"Success! Submitted Q&A pair {submitted_count}/{self.datasets_per_thread}. Target reached! Now call exit() to complete the task."
+
+                                            # Evaluate page submission rankings to nudge exploration
+                                            if submission_counts and len(submission_counts) > 1 and page_number is not None:
+                                                total_submissions = sum(submission_counts.values())
+                                                # Avoid early warnings until enough submissions exist for ranking
+                                                if total_submissions >= 5:
+                                                    sorted_pages = sorted(
+                                                        submission_counts.items(),
+                                                        key=lambda item: (-item[1], item[0])
+                                                    )
+                                                    page_rank = next(
+                                                        (idx for idx, (page, _) in enumerate(sorted_pages) if page == page_number),
+                                                        None
+                                                    )
+                                                    if page_rank is not None:
+                                                        top_threshold = max(1, min(5, max(1, int(len(sorted_pages) * 0.2))))
+                                                        page_count = submission_counts.get(page_number, 0)
+                                                        if page_rank < top_threshold and page_count > 0:
+                                                            summary = dataset_manager.get_page_submission_summary(limit=5)
+                                                            least_pages = summary.get("least_submitted_pages", [])
+                                                            tool_result += (
+                                                                f"\n\n⚠️ Page {page_number} now has {page_count} submissions (rank {page_rank + 1}/{len(sorted_pages)})."
+                                                                f" Please spend more time on pages with fewer submissions, such as: {least_pages}."
+                                                                f"\nGlobal submission stats: {json.dumps(summary, ensure_ascii=False)}"
+                                                            )
+
+                                            self._log_tool_result(thread_id, function_name, {
+                                                "count": submitted_count, 
+                                                "remaining": remaining,
+                                                "question": prompt_text,
+                                                "answer": completion_text
+                                            })
                                     
                                 elif function_name == "exit":
                                     reason = function_args.get("reason", "Task completed")

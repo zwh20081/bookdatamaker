@@ -4,9 +4,27 @@ import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+
+from rapidfuzz import fuzz
 
 import pandas as pd
+
+
+DEFAULT_DUPLICATE_THRESHOLD = 85.0
+
+
+class DuplicateEntryError(ValueError):
+    """Raised when attempting to insert a duplicate dataset entry."""
+
+    def __init__(self, existing_entry: Dict[str, Any], similarity: float) -> None:
+        self.existing_entry = existing_entry
+        self.similarity = similarity
+        message = (
+            "Duplicate entry detected: existing entry "
+            f"#{existing_entry['id']} matches with {similarity:.1f}% similarity."
+        )
+        super().__init__(message)
 
 
 class DatasetManager:
@@ -79,13 +97,63 @@ class DatasetManager:
         """
         cursor = self.conn.cursor()
         metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
-        
+
+        duplicate = self.find_similar_entry(prompt, completion, DEFAULT_DUPLICATE_THRESHOLD)
+        if duplicate:
+            existing_entry = {
+                "id": duplicate["id"],
+                "prompt": duplicate["prompt"],
+                "completion": duplicate["completion"],
+            }
+            raise DuplicateEntryError(existing_entry, duplicate["similarity"])
+
         cursor.execute(
             "INSERT INTO dataset (prompt, completion, metadata) VALUES (?, ?, ?)",
             (prompt, completion, metadata_json)
         )
         self.conn.commit()
         return cursor.lastrowid
+
+    def find_similar_entry(
+        self,
+        prompt: str,
+        completion: str,
+        threshold: float = DEFAULT_DUPLICATE_THRESHOLD
+    ) -> Optional[Dict[str, Any]]:
+        """Find an existing entry similar to the proposed prompt/completion pair.
+
+        Args:
+            prompt: Proposed question text
+            completion: Proposed answer text
+            threshold: Similarity ratio threshold for duplicate detection
+
+        Returns:
+            Dictionary with existing entry info and similarity if found, otherwise None
+        """
+        combined_candidate = f"{prompt.strip()}\n{completion.strip()}".strip().lower()
+        if not combined_candidate:
+            return None
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, prompt, completion FROM dataset")
+
+        best_match: Optional[Dict[str, Any]] = None
+        for entry_id, existing_prompt, existing_completion in cursor.fetchall():
+            combined_existing = f"{existing_prompt.strip()}\n{existing_completion.strip()}".strip().lower()
+            if not combined_existing:
+                continue
+
+            similarity = fuzz.ratio(combined_candidate, combined_existing)
+            if similarity >= threshold:
+                if not best_match or similarity > best_match["similarity"]:
+                    best_match = {
+                        "id": entry_id,
+                        "prompt": existing_prompt,
+                        "completion": existing_completion,
+                        "similarity": similarity,
+                    }
+
+        return best_match
 
     def get_entry(self, entry_id: int) -> Optional[Dict]:
         """Get a specific entry by ID.
@@ -415,6 +483,78 @@ class DatasetManager:
         cursor.execute("SELECT value FROM session_metadata WHERE key = ?", (key,))
         row = cursor.fetchone()
         return row[0] if row else None
+
+    # Page submission tracking helpers
+
+    def _load_page_submission_counts(self) -> Dict[int, int]:
+        """Load per-page submission counts from session metadata."""
+        counts_json = self.get_session_metadata("page_submission_counts")
+        counts: Dict[int, int] = {}
+        if counts_json:
+            try:
+                raw = json.loads(counts_json)
+                if isinstance(raw, dict):
+                    for key, value in raw.items():
+                        try:
+                            counts[int(key)] = int(value)
+                        except (ValueError, TypeError):
+                            continue
+            except json.JSONDecodeError:
+                pass
+        return counts
+
+    def record_page_submission(self, page_number: int) -> Dict[int, int]:
+        """Record a dataset submission for the given page.
+
+        Args:
+            page_number: Page number associated with the submission
+
+        Returns:
+            Updated dictionary mapping page numbers to submission counts
+        """
+        counts = self._load_page_submission_counts()
+        counts[page_number] = counts.get(page_number, 0) + 1
+
+        payload = json.dumps({str(k): v for k, v in counts.items()}, ensure_ascii=False)
+        self.set_session_metadata("page_submission_counts", payload)
+        self.set_session_metadata("last_submission_page", str(page_number))
+        return counts
+
+    def get_page_submission_counts(self) -> Dict[int, int]:
+        """Get per-page submission counts."""
+        return self._load_page_submission_counts()
+
+    def get_page_submission_summary(self, limit: int = 5) -> Dict[str, Any]:
+        """Get summary statistics for page submission counts."""
+        counts = self.get_page_submission_counts()
+        total_pages = len(counts)
+        total_submissions = sum(counts.values())
+
+        least_sorted = sorted(counts.items(), key=lambda item: (item[1], item[0]))
+        most_sorted = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+
+        least_pages = [page for page, _ in least_sorted[:limit]]
+        most_pages = [page for page, _ in most_sorted[:limit]]
+
+        average = total_submissions / total_pages if total_pages else 0.0
+
+        summary: Dict[str, Any] = {
+            "total_pages": total_pages,
+            "total_submissions": total_submissions,
+            "average_submissions_per_page": average,
+            "page_submission_counts": counts,
+            "least_submitted_pages": least_pages,
+            "most_submitted_pages": most_pages,
+        }
+
+        last_page = self.get_session_metadata("last_submission_page")
+        if last_page:
+            try:
+                summary["last_submission_page"] = int(last_page)
+            except ValueError:
+                summary["last_submission_page"] = last_page
+
+        return summary
     
     def get_incomplete_threads(self) -> List[Dict]:
         """Get all incomplete thread states (status != 'completed').
