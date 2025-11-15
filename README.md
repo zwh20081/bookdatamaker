@@ -151,15 +151,28 @@ Extract text from documents using DeepSeek OCR.
 
 ### API Mode
 
+**Note**: DeepSeek does not provide an official OCR API. You need to self-host DeepSeek-OCR using vLLM.
+
+#### Setup vLLM OCR Server
+
+Follow the [vLLM DeepSeek-OCR recipe](https://docs.vllm.ai/projects/recipes/en/latest/DeepSeek/DeepSeek-OCR.html) to set up your server:
+
+
+#### Use the API
+
+Once your vLLM server is running:
+
 ```bash
-# Basic usage
+# Basic usage (default: http://localhost:8000/v1)
 bookdatamaker extract book.pdf -o ./extracted
 
-# Custom API endpoint
+# Custom vLLM endpoint
 bookdatamaker extract book.pdf \
-  --deepseek-api-url https://custom-api.example.com/v1 \
+  --deepseek-api-url http://your-server:8000/v1 \
   -o ./extracted
 ```
+
+The tool uses the same OpenAI-compatible format as the vLLM recipe, with base64-encoded images and the required `extra_body` parameters for optimal OCR performance.
 
 ### Local Mode (Transformers)
 

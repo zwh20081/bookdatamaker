@@ -44,15 +44,15 @@ class OCRExtractor:
         self.llm = None
 
         if mode == "api":
-            if not api_key and not skip_model_load:
-                raise ValueError("API key is required for API mode")
             if not skip_model_load:
+                # vLLM servers typically don't require authentication
+                headers = {"Content-Type": "application/json"}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                
                 self.client = httpx.AsyncClient(
-                    timeout=60.0,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
+                    timeout=3600.0,  # Long timeout for OCR processing
+                    headers=headers,
                 )
             else:
                 self.client = None
@@ -165,7 +165,7 @@ class OCRExtractor:
             return await self._extract_text_local(image_path)
 
     async def _extract_text_api(self, image_path: Path) -> str:
-        """Extract text using API.
+        """Extract text using vLLM API (OpenAI-compatible format).
 
         Args:
             image_path: Path to image file
@@ -175,17 +175,47 @@ class OCRExtractor:
         """
         image_b64 = self._encode_image(image_path)
 
+        # Use OpenAI-compatible chat completions endpoint
+        # Format matches vLLM DeepSeek-OCR recipe
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "image": {
+                            "base64": image_b64
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": "<|grounding|>Convert the document to markdown."
+                    }
+                ]
+            }
+        ]
+
         response = await self.client.post(
-            f"{self.api_url}/ocr",
+            f"{self.api_url}/chat/completions",
             json={
-                "image": image_b64,
-                "model": "deepseek-ocr",
+                "model": "deepseek-ai/DeepSeek-OCR",
+                "messages": messages,
+                "max_tokens": 8192,
+                "temperature": 0.0,
+                "extra_body": {
+                    "skip_special_tokens": False,
+                    "vllm_xargs": {
+                        "ngram_size": 30,
+                        "window_size": 90,
+                        "whitelist_token_ids": [128821, 128822],
+                    },
+                },
             },
         )
         response.raise_for_status()
 
         result = response.json()
-        return result.get("text", "")
+        return result["choices"][0]["message"]["content"]
 
     async def _extract_text_local(self, image_path: Path) -> str:
         """Extract text using local transformers model.
@@ -492,14 +522,30 @@ class OCRExtractor:
                 # API mode - process sequentially
                 image_results = []
                 import tempfile
+                from tqdm import tqdm
                 
-                for page_num, image in image_pages:
+                # Process with progress bar
+                for page_num, image in tqdm(image_pages, desc="OCR Processing", unit="page", ncols=100):
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                         image.save(tmp.name)
                         tmp_path = Path(tmp.name)
                     
                     try:
                         text = await self.extract_text(tmp_path)
+                        
+                        # Save to output directory if provided
+                        if output_dir:
+                            page_dir = output_dir / f"page_{page_num:03d}"
+                            page_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            # Save text to result.mmd
+                            result_file = page_dir / "result.mmd"
+                            result_file.write_text(text, encoding="utf-8")
+                            
+                            # Save page image
+                            image_file = page_dir / f"page_{page_num:03d}.png"
+                            image.save(image_file)
+                        
                         image_results.append((page_num, text))
                     finally:
                         tmp_path.unlink()

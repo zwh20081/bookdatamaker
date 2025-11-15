@@ -44,13 +44,13 @@ def cli(ctx: click.Context) -> None:
 @click.option(
     "--deepseek-api-key",
     envvar="DEEPSEEK_API_KEY",
-    help="DeepSeek API key (required for API mode)",
+    help="API key for vLLM server (optional, most vLLM servers don't require authentication)",
 )
 @click.option(
     "--deepseek-api-url",
     envvar="DEEPSEEK_API_URL",
-    default="https://api.deepseek.com/v1",
-    help="DeepSeek API URL",
+    default="http://localhost:8000/v1",
+    help="vLLM API URL (default: http://localhost:8000/v1)",
 )
 @click.option(
     "--local-model-path",
@@ -91,10 +91,6 @@ def extract(
 
     INPUT_PATH: Path to image file, PDF, EPUB, or directory containing files
     """
-    if mode == "api" and not deepseek_api_key:
-        click.echo("Error: DeepSeek API key required for API mode", err=True)
-        raise click.Abort()
-
     asyncio.run(
         _extract_async(
             input_path,
