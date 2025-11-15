@@ -296,7 +296,6 @@ class OCRExtractor:
             json={
                 "model": "deepseek-ai/DeepSeek-OCR",
                 "messages": messages,
-                "max_tokens": 8192,
                 "temperature": 0.0,
                 "extra_body": {
                     "skip_special_tokens": False,
