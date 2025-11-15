@@ -155,7 +155,7 @@ Extract text from documents using DeepSeek OCR.
 
 #### Setup vLLM OCR Server
 
-Follow the [vLLM DeepSeek-OCR recipe](https://docs.vllm.ai/projects/recipes/en/latest/DeepSeek/DeepSeek-OCR.html) to set up your server:
+Follow the [vLLM DeepSeek-OCR recipe](https://docs.vllm.ai/projects/recipes/en/latest/DeepSeek/DeepSeek-OCR.html) to set up your server
 
 
 #### Use the API
