@@ -18,12 +18,6 @@ A powerful CLI tool for extracting text from documents using DeepSeek OCR and ge
 - [Position Distribution](#position-distribution)
 - [Performance Tuning](#performance-tuning)
 - [Interactive Chat](#interactive-chat)
-- [MCP Server](#mcp-server)
-
-### 📚 Reference
-- [Command Reference](#command-reference)
-- [Troubleshooting](#troubleshooting)
-- [Development](#development)
 
 ---
 
