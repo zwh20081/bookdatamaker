@@ -533,8 +533,8 @@ async def _run_mcp_server(
     "--format",
     "-f",
     type=click.Choice(["jsonl", "parquet", "csv", "json"], case_sensitive=False),
-    default="jsonl",
-    help="Export format (default: jsonl)",
+    default=None,
+    help="Export format (default: auto-detect from file extension)",
 )
 @click.option(
     "--include-metadata",
@@ -585,9 +585,23 @@ def export_dataset(
                     status.print_warning("No entries found in database")
                     return
                 
+                # Auto-detect format from file extension if not specified
+                if format is None:
+                    ext = output.suffix.lower()
+                    format_map = {
+                        '.jsonl': 'jsonl',
+                        '.parquet': 'parquet',
+                        '.csv': 'csv',
+                        '.json': 'json'
+                    }
+                    format = format_map.get(ext, 'jsonl')
+                    status.print_info(f"Auto-detected format from extension: {format}")
+                
                 status.print_info(f"Found {count} entries")
                 status.print_info(f"Exporting to: {output}")
                 status.print_info(f"Format: {format.upper()}")
+                if format.lower() == "parquet":
+                    status.print_info(f"Compression: {compression}")
                 
                 # Export based on format
                 if format.lower() == "jsonl":
