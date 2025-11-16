@@ -406,8 +406,14 @@ bookdatamaker generate ./extracted \
 Export from SQLite database to your preferred format:
 
 ```bash
-# Parquet (recommended for data analysis)
+# Parquet (recommended for data analysis, default: zstd compression)
 bookdatamaker export-dataset dataset.db -o output.parquet
+
+# Parquet with different compression methods
+bookdatamaker export-dataset dataset.db -o output.parquet -c snappy  # Faster, larger files
+bookdatamaker export-dataset dataset.db -o output.parquet -c gzip    # Smaller, slower
+bookdatamaker export-dataset dataset.db -o output.parquet -c brotli  # Best compression
+bookdatamaker export-dataset dataset.db -o output.parquet -c none    # No compression
 
 # JSON Lines (easy to stream)
 bookdatamaker export-dataset dataset.db -o output.jsonl -f jsonl
@@ -418,6 +424,18 @@ bookdatamaker export-dataset dataset.db -o output.csv -f csv
 # JSON with metadata
 bookdatamaker export-dataset dataset.db -o output.json -f json --include-metadata
 ```
+
+### Compression Comparison
+
+**For Parquet files:**
+
+| Method | Speed | Size | Use Case |
+|--------|-------|------|----------|
+| `zstd` (default) | Fast | Small | Best balance, recommended |
+| `snappy` | Fastest | Larger | Real-time processing |
+| `gzip` | Medium | Smaller | Network transfer |
+| `brotli` | Slowest | Smallest | Archival storage |
+| `none` | Instant | Largest | Debug/testing only |
 
 ## Position Distribution
 

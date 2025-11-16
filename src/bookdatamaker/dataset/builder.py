@@ -42,14 +42,14 @@ class DatasetBuilder:
     def save_parquet(
         self,
         output_path: Path,
-        compression: str = "snappy",
+        compression: str = "zstd",
         schema: pa.Schema = None,
     ) -> None:
-        """Save dataset to Parquet format.
+        """Save dataset to Parquet format with zstd compression.
 
         Args:
             output_path: Output file path
-            compression: Compression algorithm (snappy, gzip, brotli, etc.)
+            compression: Compression algorithm (default: zstd, also supports snappy, gzip, brotli, etc.)
             schema: Optional PyArrow schema
         """
         df = self.to_dataframe()

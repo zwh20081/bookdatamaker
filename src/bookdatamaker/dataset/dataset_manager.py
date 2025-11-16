@@ -238,12 +238,13 @@ class DatasetManager:
         
         return len(entries)
 
-    def export_parquet(self, output_path: str, include_metadata: bool = False) -> int:
-        """Export dataset to Parquet format.
+    def export_parquet(self, output_path: str, include_metadata: bool = False, compression: str = 'zstd') -> int:
+        """Export dataset to Parquet format with configurable compression.
 
         Args:
             output_path: Output file path
             include_metadata: Whether to include metadata column
+            compression: Compression method (zstd, snappy, gzip, brotli, none)
 
         Returns:
             Number of entries exported
@@ -267,7 +268,10 @@ class DatasetManager:
         
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(output_file, index=False)
+        
+        # Use pyarrow with specified compression
+        compression_value = None if compression.lower() == 'none' else compression.lower()
+        df.to_parquet(output_file, index=False, compression=compression_value, engine='pyarrow')
         
         return len(entries)
 

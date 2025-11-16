@@ -541,11 +541,19 @@ async def _run_mcp_server(
     is_flag=True,
     help="Include metadata and timestamps in export",
 )
+@click.option(
+    "--compression",
+    "-c",
+    type=click.Choice(["zstd", "snappy", "gzip", "brotli", "none"], case_sensitive=False),
+    default="zstd",
+    help="Compression method for Parquet format (default: zstd)",
+)
 def export_dataset(
     db_file: Path,
     output: Path,
     format: str,
-    include_metadata: bool
+    include_metadata: bool,
+    compression: str
 ) -> None:
     """Export dataset from SQLite database to various formats.
 
@@ -585,7 +593,7 @@ def export_dataset(
                 if format.lower() == "jsonl":
                     exported = dm.export_jsonl(str(output))
                 elif format.lower() == "parquet":
-                    exported = dm.export_parquet(str(output), include_metadata=include_metadata)
+                    exported = dm.export_parquet(str(output), include_metadata=include_metadata, compression=compression)
                 elif format.lower() == "csv":
                     exported = dm.export_csv(str(output), include_metadata=include_metadata)
                 elif format.lower() == "json":
