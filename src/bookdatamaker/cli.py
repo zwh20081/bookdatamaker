@@ -307,6 +307,12 @@ async def _extract_async(
     default=None,
     help="Maximum message history to keep (only last N messages). When limit reached, keeps system prompt + last 10 messages. Helps prevent token overflow.",
 )
+@click.option(
+    "--api-delay",
+    type=float,
+    default=0.0,
+    help="Delay in seconds between API requests (API mode only). Use to avoid rate limits. Example: 0.5 for 500ms delay.",
+)
 def generate(
     extracted_dir: Path,
     db: Path,
@@ -322,6 +328,7 @@ def generate(
     custom_prompt: Optional[str],
     tool_call_parser: Optional[str],
     max_messages: Optional[int],
+    api_delay: float,
 ) -> None:
     """Generate dataset using parallel LLM threads with MCP navigation.
 
@@ -366,6 +373,7 @@ def generate(
             custom_prompt,
             tool_call_parser,
             max_messages,
+            api_delay,
         )
     )
 
@@ -385,6 +393,7 @@ async def _generate_async(
     custom_prompt: Optional[str],
     tool_call_parser: Optional[str],
     max_messages: Optional[int],
+    api_delay: float,
 ) -> None:
     """Async implementation of parallel dataset generation."""
     from bookdatamaker.llm.parallel_generator import ParallelDatasetGenerator
@@ -434,6 +443,7 @@ async def _generate_async(
         custom_prompt=custom_prompt,
         tool_call_parser=tool_call_parser,
         max_messages=max_messages,
+        api_delay=api_delay,
     )
 
     click.echo(f"\nStarting {generator.num_threads} parallel threads")

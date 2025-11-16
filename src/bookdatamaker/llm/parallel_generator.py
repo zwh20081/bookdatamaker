@@ -83,6 +83,7 @@ class ParallelDatasetGenerator:
         custom_prompt: Optional[str] = None,
         tool_call_parser: Optional[str] = None,
         max_messages: Optional[int] = None,
+        api_delay: float = 0.0,
     ) -> None:
         """Initialize parallel dataset generator.
 
@@ -101,6 +102,7 @@ class ParallelDatasetGenerator:
             custom_prompt: Additional custom instructions for system prompt
             tool_call_parser: Tool call parser name for vLLM (required for vLLM mode)
             max_messages: Maximum message history to keep (None = unlimited)
+            api_delay: Delay in seconds between API requests (default: 0.0)
         """
         self.page_manager = page_manager
         self.db_path = db_path
@@ -117,6 +119,7 @@ class ParallelDatasetGenerator:
         self.custom_prompt = custom_prompt
         self.tool_call_parser = tool_call_parser
         self.max_messages = max_messages
+        self.api_delay = api_delay
         self.vllm_llm = None  # Will be initialized if using vLLM mode
         
         # Progress tracking
@@ -696,6 +699,10 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                             request_params["model"] = self.model
                         
                         response = client.chat.completions.create(**request_params)
+
+                        # Add delay after API call if configured
+                        if self.api_delay > 0:
+                            time.sleep(self.api_delay)
 
                         message = response.choices[0].message
                         
