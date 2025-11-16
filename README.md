@@ -184,8 +184,6 @@ bookdatamaker extract book.pdf \
   - Adjust based on your vLLM server capacity and network bandwidth
   - Example: 8-16 for powerful servers, 2-4 for smaller setups
 
-The tool uses image URLs via a temporary HTTP server (uvicorn/FastAPI) instead of base64 encoding, which is more efficient for vLLM. Images are automatically copied to a temporary directory and served via HTTP, then cleaned up after processing.
-
 ### Local Mode (Transformers)
 
 Use local transformers model for OCR (DeepSeek-OCR, no API calls):
