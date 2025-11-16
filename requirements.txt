@@ -13,8 +13,6 @@ PyMuPDF
 ebooklib
 beautifulsoup4
 rapidfuzz
-uvicorn
-fastapi
 
 # Optional: for self-hosted models
 # transformers==4.46.3

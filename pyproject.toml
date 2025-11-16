@@ -28,8 +28,6 @@ dependencies = [
     "ebooklib",
     "beautifulsoup4",
     "rapidfuzz",
-    "uvicorn",
-    "fastapi",
 ]
 
 [project.optional-dependencies]

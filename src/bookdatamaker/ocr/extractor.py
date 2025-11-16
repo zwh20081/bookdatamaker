@@ -45,9 +45,6 @@ class OCRExtractor:
         self.skip_model_load = skip_model_load
         self.api_concurrency = api_concurrency
         self.llm = None
-        self.http_server = None
-        self.http_thread = None
-        self.temp_dir = None
 
         if mode == "api":
             if not skip_model_load:
@@ -60,8 +57,6 @@ class OCRExtractor:
                     timeout=3600.0,  # Long timeout for OCR processing
                     headers=headers,
                 )
-                # Start HTTP server for serving images
-                self._start_http_server()
             else:
                 self.client = None
         else:
@@ -78,7 +73,6 @@ class OCRExtractor:
         if self.mode == "api":
             if self.client:
                 await self.client.aclose()
-            self._stop_http_server()
 
     def _init_local_model(self) -> None:
         """Initialize local transformers model."""
@@ -132,94 +126,6 @@ class OCRExtractor:
         ).to(self.device)
         self.model = self.model.eval()
         
-    def _start_http_server(self, port: int = 8765) -> None:
-        """Start uvicorn HTTP server for serving temporary images.
-        
-        Args:
-            port: Port to bind the HTTP server
-        """
-        import tempfile
-        import threading
-        import socket
-        from fastapi import FastAPI
-        from fastapi.staticfiles import StaticFiles
-        import uvicorn
-        
-        # Create temp directory
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="ocr_images_"))
-        
-        # Find available port
-        self.http_port = port
-        for attempt_port in range(port, port + 100):
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(('', attempt_port))
-                    self.http_port = attempt_port
-                    break
-            except OSError:
-                continue
-        
-        # Create FastAPI app
-        app = FastAPI()
-        app.mount("/", StaticFiles(directory=str(self.temp_dir)), name="images")
-        
-        # Configure uvicorn with minimal logging
-        config = uvicorn.Config(
-            app=app,
-            host="0.0.0.0",
-            port=self.http_port,
-            log_level="error",
-            access_log=False,
-        )
-        self.http_server = uvicorn.Server(config)
-        
-        # Start server in background thread
-        def run_server():
-            asyncio.new_event_loop().run_until_complete(self.http_server.serve())
-        
-        self.http_thread = threading.Thread(target=run_server, daemon=True)
-        self.http_thread.start()
-        
-        # Wait for server to start
-        import time
-        time.sleep(0.5)
-    
-    def _stop_http_server(self) -> None:
-        """Stop HTTP server and cleanup temp directory."""
-        if self.http_server:
-            self.http_server.should_exit = True
-            if self.http_thread:
-                self.http_thread.join(timeout=2.0)
-            self.http_server = None
-        
-        if self.temp_dir and self.temp_dir.exists():
-            import shutil
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
-            self.temp_dir = None
-    
-    def _get_image_url(self, image_path: Path) -> str:
-        """Copy image to temp directory and return URL.
-        
-        Args:
-            image_path: Path to source image
-            
-        Returns:
-            HTTP URL to access the image
-        """
-        import shutil
-        import uuid
-        
-        # Generate unique filename
-        filename = f"{uuid.uuid4().hex}{image_path.suffix}"
-        dest_path = self.temp_dir / filename
-        
-        # Copy image to temp directory
-        shutil.copy2(image_path, dest_path)
-        
-        # Return URL (localhost)
-        return f"http://localhost:{self.http_port}/{filename}"
-
-
     def _filter_ocr_text(self, text: str) -> str:
         """Filter OCR text to remove lines containing [[.....]] pattern and empty lines.
         
@@ -242,13 +148,13 @@ class OCRExtractor:
         return '\n'.join(filtered_lines)
     
     def _encode_image(self, image_path: Path) -> str:
-        """Encode image to base64.
+        """Encode image to base64 data URL.
 
         Args:
             image_path: Path to image file
 
         Returns:
-            Base64 encoded image string
+            Base64 encoded image as data URL (data:image/jpeg;base64,...)
         """
         with Image.open(image_path) as img:
             # Convert to RGB if necessary
@@ -262,7 +168,8 @@ class OCRExtractor:
             img.save(buffer, format="JPEG")
             img_bytes = buffer.getvalue()
 
-        return base64.b64encode(img_bytes).decode("utf-8")
+        base64_str = base64.b64encode(img_bytes).decode("utf-8")
+        return f"data:image/jpeg;base64,{base64_str}"
 
     async def extract_text(self, image_path: Path) -> str:
         """Extract text from a single image.
@@ -290,10 +197,10 @@ class OCRExtractor:
         Returns:
             Extracted text content
         """
-        # Copy image to temp directory and get URL
-        image_url = self._get_image_url(image_path)
+        # Encode image to base64 data URL
+        image_data_url = self._encode_image(image_path)
 
-        # Use OpenAI-compatible chat completions endpoint with image_url
+        # Use OpenAI-compatible chat completions endpoint with base64 image
         messages = [
             {
                 "role": "user",
@@ -301,7 +208,7 @@ class OCRExtractor:
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": image_url
+                            "url": image_data_url
                         }
                     },
                     {
