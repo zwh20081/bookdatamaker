@@ -605,6 +605,20 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                 # Try to restore from checkpoint
                 saved_state = dataset_manager.get_thread_state(thread_id)
                 
+                # Check if thread already completed
+                if saved_state and saved_state["status"] == "completed":
+                    
+                    # Update progress bar to reflect already completed work
+                    self._update_progress(saved_state['submitted_count'])
+                    
+                    # Return completed state
+                    return {
+                        "thread_id": thread_id,
+                        "submitted": saved_state["submitted_count"],
+                        "status": "completed",
+                        "iterations": 0  # No new iterations since already done
+                    }
+                
                 if saved_state and saved_state["status"] != "completed":
                     # Resume from checkpoint
                     current_position = saved_state["current_position"]
