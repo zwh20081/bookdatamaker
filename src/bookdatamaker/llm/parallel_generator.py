@@ -186,16 +186,18 @@ class ParallelDatasetGenerator:
                 else:
                     count = result.get('count', '?')
                     remaining = result.get('remaining', 0)
-                    question = result.get('question', '')
-                    answer = result.get('answer', '')
+                    turns = result.get('turns', 1)
+                    messages = result.get('messages', [])
                     
-                    # Truncate long text for display
-                    max_len = 60
-                    q_display = question[:max_len] + "..." if len(question) > max_len else question
-                    a_display = answer[:max_len] + "..." if len(answer) > max_len else answer
-                    
-                    tqdm.write(f"[Thread {thread_id}] ✓ #{count} Q: {q_display}")
-                    tqdm.write(f"[Thread {thread_id}]      A: {a_display} ({remaining} remaining)")
+                    # Display first two messages (first turn)
+                    if len(messages) >= 2:
+                        user_msg = messages[0][:60] + "..." if len(messages[0]) > 60 else messages[0]
+                        assistant_msg = messages[1][:60] + "..." if len(messages[1]) > 60 else messages[1]
+                        tqdm.write(f"[Thread {thread_id}] ✓ #{count} {turns}-turn conversation ({remaining} remaining)")
+                        tqdm.write(f"[Thread {thread_id}]    Q: {user_msg}")
+                        tqdm.write(f"[Thread {thread_id}]    A: {assistant_msg}")
+                    else:
+                        tqdm.write(f"[Thread {thread_id}] ✓ #{count} Submitted {turns}-turn conversation ({remaining} remaining)")
             elif tool_name == "exit":
                 if result.get("rejected"):
                     tqdm.write(f"[Thread {thread_id}] ❌ Exit rejected: {result.get('remaining', 0)} pairs remaining")
@@ -866,7 +868,8 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                             self._log_tool_result(thread_id, function_name, {
                                                 "count": submitted_count, 
                                                 "remaining": remaining,
-                                                "turns": turns
+                                                "turns": turns,
+                                                "messages": messages_array
                                             })
                                     
                                 elif function_name == "exit":
