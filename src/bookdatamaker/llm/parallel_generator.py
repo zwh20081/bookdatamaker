@@ -287,6 +287,23 @@ When calling submit_dataset, provide a "messages" array with alternating user/as
 - Cover diverse topics and difficulty levels
 - Explore content near your assigned starting position (page {start_page})
 
+## SELF-CONTAINED CONTENT REQUIREMENT - EXTREMELY IMPORTANT
+**All conversation content MUST be completely self-contained and standalone:**
+- ❌ NEVER use phrases like: "根据文本", "文中提到", "文章指出", "上文说明", "原文描述", "according to the text", "the document states", etc.
+- ❌ NEVER reference "the document", "the text", "the material", "the passage", "the article", "the book", etc.
+- ✅ Present all information as direct knowledge without any meta-references
+- ✅ User questions should be natural inquiries about the topic itself
+- ✅ Assistant answers should explain concepts/facts directly as if from general knowledge
+- ✅ Include all necessary context within the answer itself - don't assume access to source material
+
+**Examples:**
+- ❌ BAD: "根据文本，光合作用是植物..." → This references the source
+- ✅ GOOD: "光合作用是植物通过叶绿素..." → Direct explanation
+- ❌ BAD: "文中提到的三个步骤是..." → References document
+- ✅ GOOD: "这个过程包含三个步骤..." → Direct presentation
+- ❌ BAD: "What does the text say about X?" → Meta-question
+- ✅ GOOD: "What is X?" or "How does X work?" → Direct question
+
 ## Content Adaptation Rules
 When generating Q&A pairs, adapt your approach based on content type:
 
