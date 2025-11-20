@@ -92,7 +92,7 @@ class ParallelDatasetGenerator:
             db_path: Path to SQLite database
             mode: 'api' or 'vllm'
             distribution: Distribution string (e.g., "10,10,20,30,20,10")
-            datasets_per_thread: Target Q&A pairs per thread
+            datasets_per_thread: Target number of conversations per thread
             openai_api_key: OpenAI API key (for API mode)
             openai_api_url: OpenAI API URL
             model: Model name (optional, uses server default if None)
@@ -240,12 +240,12 @@ class ParallelDatasetGenerator:
             System prompt text
         """
         total_pages = self.page_manager.get_total_pages()
-        base_prompt = f"""You are a helpful assistant with access to the following tools to help generate Q&A pairs from a document.
+        base_prompt = f"""You are a helpful assistant with access to the following tools to help generate multi-turn conversations from a document.
 
 # Task
 - Starting position: Page {start_page}
 - Total pages: {total_pages}
-- Target: Generate exactly {self.datasets_per_thread} question-answer pairs
+- Target: Generate exactly {self.datasets_per_thread} multi-turn conversations
 - Thread ID: {thread_id}
 
 # Available Tools
@@ -255,9 +255,16 @@ You have access to the following tools:
 - previous_page: Move to the previous page(s) and get content
 - jump_to_page: Jump to a specific page by page number
 - get_page_context: Get current page with surrounding pages for context
-- submit_dataset: Submit a question-answer pair to the dataset
+- submit_dataset: Submit a multi-turn conversation to the dataset (see format below)
 - exit: Exit the session after completing all submissions
 - get_page_access_summary: View global coverage stats and find pages with the fewest visits
+
+# Multi-Turn Conversation Format
+When calling submit_dataset, provide a "messages" array with alternating user/assistant messages:
+- Must start with a user message and end with an assistant message
+- Can be single-turn (2 messages) or multi-turn (4, 6, 8+ messages)
+- Example single-turn: ["What is X?", "X is..."]
+- Example multi-turn: ["What is X?", "X is...", "Can you explain more?", "Sure, X also..."]
 
 # Navigation Guidelines
 - Start at page {start_page} (your assigned starting position)
@@ -268,14 +275,15 @@ You have access to the following tools:
 # Workflow
 1. Use jump_to_page({start_page}) to start reading from page {start_page}
 2. Use next_page and previous_page to explore nearby pages sequentially
-3. When you find good content, generate a Q&A pair
-4. Use submit_dataset with input (question) and output (answer) to save it
-5. Repeat until you have submitted {self.datasets_per_thread} pairs
+3. When you find good content, generate a conversation
+4. Use submit_dataset with messages array (alternating user/assistant) to save it
+5. Repeat until you have submitted {self.datasets_per_thread} conversations
 6. Call exit when you reach {self.datasets_per_thread} submissions
 
 # Quality Guidelines - CRITICAL
 - Questions should be clear and answerable from the document
 - Answers must be accurate and based on document content
+- Multi-turn conversations should flow naturally and build on previous exchanges
 - Cover diverse topics and difficulty levels
 - Explore content near your assigned starting position (page {start_page})
 
@@ -322,20 +330,19 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                 "type": "function",
                 "function": {
                     "name": "submit_dataset",
-                    "description": "Submit a Q&A pair to the dataset",
+                    "description": "Submit a multi-turn conversation to the dataset. Provide an array of strings alternating between user and assistant messages.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "input": {
-                                "type": "string",
-                                "description": "The question text"
-                            },
-                            "output": {
-                                "type": "string",
-                                "description": "The answer text"
+                            "messages": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Array of message strings alternating user/assistant. Must start with user, end with assistant. Example: ['user msg 1', 'assistant reply 1', 'user msg 2', 'assistant reply 2']"
                             }
                         },
-                        "required": ["input", "output"]
+                        "required": ["messages"]
                     }
                 }
             },
@@ -446,7 +453,7 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
         """Run parallel dataset generation.
 
         Returns:
-            Total number of Q&A pairs generated
+            Total number of conversations generated
         """
         from tqdm import tqdm
         import threading
@@ -752,32 +759,36 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                 
                                 # Execute tool and get result
                                 if function_name == "submit_dataset":
-                                    prompt_text = function_args.get("input", "").strip()
-                                    completion_text = function_args.get("output", "").strip()
+                                    messages_array = function_args.get("messages", [])
                                     
-                                    # Validate that prompt and completion are not empty
-                                    if not prompt_text or not completion_text:
-                                        tool_result = "Error: Both 'input' (question) and 'output' (answer) cannot be empty. Please provide valid content for both fields."
-                                        self._log_tool_result(thread_id, function_name, {"error": "Empty input or output"})
+                                    # Validate messages format
+                                    if not messages_array:
+                                        tool_result = "Error: messages array cannot be empty"
+                                        self._log_tool_result(thread_id, function_name, {"error": "Empty messages array"})
+                                    elif len(messages_array) < 2:
+                                        tool_result = "Error: messages must contain at least one user-assistant pair (minimum 2 messages)"
+                                        self._log_tool_result(thread_id, function_name, {"error": "Insufficient messages"})
+                                    elif len(messages_array) % 2 != 0:
+                                        tool_result = "Error: messages must have even length (alternating user-assistant pairs)"
+                                        self._log_tool_result(thread_id, function_name, {"error": "Odd number of messages"})
                                     else:
                                         try:
-                                            entry_id = dataset_manager.add_entry(prompt_text, completion_text)
+                                            entry_id = dataset_manager.add_entry(messages_array)
+                                        except ValueError as ve:
+                                            tool_result = f"Error: {str(ve)}"
+                                            self._log_tool_result(thread_id, function_name, {"error": str(ve)})
                                         except DuplicateEntryError as duplicate_error:
                                             similarity_pct = duplicate_error.similarity
                                             existing_id = duplicate_error.existing_entry["id"]
                                             tool_result = (
-                                                "Duplicate submission rejected. The proposed Q&A pair "
+                                                "Duplicate submission rejected. The proposed conversation "
                                                 f"matches existing entry #{existing_id} with {similarity_pct:.1f}% similarity. "
                                                 "Please explore different content (consider using next_page) before submitting."
-                                                f"\nRejected question: {prompt_text}"
-                                                f"\nRejected answer: {completion_text}"
                                             )
                                             self._log_tool_result(thread_id, function_name, {
                                                 "error": f"Duplicate entry #{existing_id} ({similarity_pct:.1f}%)",
                                                 "existing_id": existing_id,
                                                 "similarity": similarity_pct,
-                                                "question": prompt_text,
-                                                "answer": completion_text,
                                             })
                                         else:
                                             submitted_count += 1
@@ -802,12 +813,13 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                             )
                                             
                                             remaining = self.datasets_per_thread - submitted_count
+                                            turns = len(messages_array) // 2
                                             if remaining > 0:
-                                                tool_result = f"Success! Submitted Q&A pair {submitted_count}/{self.datasets_per_thread}. You need {remaining} more pairs. Continue exploring and generating."
+                                                tool_result = f"Success! Submitted {turns}-turn conversation {submitted_count}/{self.datasets_per_thread}. You need {remaining} more conversations. Continue exploring and generating."
                                                 if self.custom_prompt:
                                                     tool_result += f"\n\nREMINDER: {self.custom_prompt}"
                                             else:
-                                                tool_result = f"Success! Submitted Q&A pair {submitted_count}/{self.datasets_per_thread}. Target reached! Now call exit() to complete the task."
+                                                tool_result = f"Success! Submitted {turns}-turn conversation {submitted_count}/{self.datasets_per_thread}. Target reached! Now call exit() to complete the task."
 
                                             # Evaluate page submission rankings to nudge exploration
                                             if submission_counts and len(submission_counts) > 1 and page_number is not None:
@@ -837,8 +849,7 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                             self._log_tool_result(thread_id, function_name, {
                                                 "count": submitted_count, 
                                                 "remaining": remaining,
-                                                "question": prompt_text,
-                                                "answer": completion_text
+                                                "turns": turns
                                             })
                                     
                                 elif function_name == "exit":

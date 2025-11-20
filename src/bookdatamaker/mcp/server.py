@@ -299,20 +299,19 @@ class MCPServer:
                 ),
                 Tool(
                     name="submit_dataset",
-                    description="Submit a Q&A pair to the dataset. Use this to save question-answer pairs generated during document analysis.",
+                    description="Submit a multi-turn conversation to the dataset. Provide an array of strings alternating between user and assistant messages (must start with user, end with assistant).",
                     inputSchema={
                         "type": "object",
                         "properties": {
-                            "input": {
-                                "type": "string",
-                                "description": "The input/question text",
-                            },
-                            "output": {
-                                "type": "string",
-                                "description": "The output/answer text",
+                            "messages": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Array of message strings alternating user/assistant. Example: ['user message 1', 'assistant reply 1', 'user message 2', 'assistant reply 2']",
                             }
                         },
-                        "required": ["input", "output"],
+                        "required": ["messages"],
                     },
                 ),
                 Tool(
@@ -667,29 +666,41 @@ class MCPServer:
                 return [TextContent(type="text", text=str(response))]
             
             elif name == "submit_dataset":
-                prompt_text = arguments.get("input", "").strip()
-                completion_text = arguments.get("output", "").strip()
+                messages = arguments.get("messages", [])
                 
-                # Validate that prompt and completion are not empty
-                if not prompt_text or not completion_text:
+                # Validate messages format
+                if not messages:
                     response = {
                         "status": "error",
-                        "message": "Both 'input' (question) and 'output' (answer) cannot be empty. Please provide valid content for both fields."
+                        "message": "messages array cannot be empty"
+                    }
+                elif len(messages) < 2:
+                    response = {
+                        "status": "error",
+                        "message": "messages must contain at least one user-assistant pair (minimum 2 messages)"
+                    }
+                elif len(messages) % 2 != 0:
+                    response = {
+                        "status": "error",
+                        "message": "messages must have even length (alternating user-assistant pairs)"
                     }
                 # Save to database if dataset_manager is available
                 elif self.dataset_manager:
-                    entry_id = self.dataset_manager.add_entry(prompt_text, completion_text)
-                    total_entries = self.dataset_manager.count_entries()
-                    
-                    response = {
-                        "status": "success",
-                        "message": f"Dataset entry saved to database. Total entries: {total_entries}",
-                        "entry_id": entry_id,
-                        "entry": {
-                            "prompt": prompt_text,
-                            "completion": completion_text
+                    try:
+                        entry_id = self.dataset_manager.add_entry(messages)
+                        total_entries = self.dataset_manager.count_entries()
+                        
+                        response = {
+                            "status": "success",
+                            "message": f"Multi-turn conversation saved to database. Total entries: {total_entries}",
+                            "entry_id": entry_id,
+                            "turns": len(messages) // 2
                         }
-                    }
+                    except ValueError as e:
+                        response = {
+                            "status": "error",
+                            "message": str(e)
+                        }
                 else:
                     response = {
                         "status": "error",

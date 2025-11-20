@@ -257,7 +257,7 @@ async def _extract_async(
     "--datasets-per-thread",
     type=int,
     default=10,
-    help="Target number of Q&A pairs per thread",
+    help="Target number of conversations per thread",
 )
 @click.option(
     "--openai-api-key",
@@ -335,7 +335,7 @@ def generate(
     EXTRACTED_DIR: Path to directory containing page_XXX/ subdirectories (from extract command)
     
     This command starts multiple LLM threads at different positions in the document.
-    Each thread navigates the document using MCP tools and generates Q&A pairs.
+    Each thread navigates the document using MCP tools and generates conversations.
     
     Examples:
         # API mode
@@ -475,7 +475,7 @@ def mcp_server(extracted_dir: Path, db: Path) -> None:
 
     EXTRACTED_DIR: Path to directory containing page_XXX/ subdirectories (from extract command)
     
-    The MCP server allows LLMs to navigate the document by pages and submit Q&A pairs
+    The MCP server allows LLMs to navigate the document by pages and submit conversations
     to build a dataset. All navigation methods return unified responses with
     page_number and content.
     
@@ -751,11 +751,14 @@ Available tools:
 - previous_page: Move to previous page(s)
 - jump_to_page: Jump to a specific page number
 - get_page_context: Get current page with surrounding pages
-- submit_dataset: Submit a question-answer pair to the database (optional)
+- submit_dataset: Submit a multi-turn conversation to the database (messages array: alternating user/assistant)
 - exit: End the conversation
 
-You can explore the document, answer questions, and help generate Q&A pairs.
-Use the tools to access document content when needed."""
+You can explore the document, answer questions, and help generate multi-turn conversations.
+Use the tools to access document content when needed.
+
+For submit_dataset, provide a "messages" array with alternating user/assistant messages, starting with user and ending with assistant.
+Example: ["What is X?", "X is...", "Can you explain more?", "Sure, X also..."]"""
     
     messages = [{"role": "system", "content": system_prompt}]
     current_position = 1
@@ -825,15 +828,22 @@ Use the tools to access document content when needed."""
                     
                     # Execute tool
                     if function_name == "submit_dataset":
-                        input_text = function_args.get("input", "").strip()
-                        output_text = function_args.get("output", "").strip()
+                        messages_array = function_args.get("messages", [])
                         
-                        # Validate that input and output are not empty
-                        if not input_text or not output_text:
-                            tool_result = "Error: Both 'input' (question) and 'output' (answer) cannot be empty. Please provide valid content for both fields."
+                        # Validate messages format
+                        if not messages_array:
+                            tool_result = "Error: messages array cannot be empty"
+                        elif len(messages_array) < 2:
+                            tool_result = "Error: messages must contain at least one user-assistant pair (minimum 2 messages)"
+                        elif len(messages_array) % 2 != 0:
+                            tool_result = "Error: messages must have even length (alternating user-assistant pairs)"
                         else:
-                            entry_id = dataset_manager.add_entry(input_text, output_text)
-                            tool_result = f"Success! Q&A pair saved to database (ID: {entry_id})"
+                            try:
+                                entry_id = dataset_manager.add_entry(messages_array)
+                                turns = len(messages_array) // 2
+                                tool_result = f"Success! {turns}-turn conversation saved to database (ID: {entry_id})"
+                            except ValueError as e:
+                                tool_result = f"Error: {str(e)}"
                         
                     elif function_name == "exit":
                         console.print("\n[yellow]Assistant requested to exit. Goodbye![/yellow]")

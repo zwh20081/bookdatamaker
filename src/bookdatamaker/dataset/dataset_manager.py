@@ -1,4 +1,4 @@
-"""Dataset manager for storing Q&A pairs in SQLite and exporting to various formats."""
+"""Dataset manager for storing multi-turn conversations in SQLite and exporting to various formats."""
 
 import json
 import sqlite3
@@ -47,8 +47,7 @@ class DatasetManager:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS dataset (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt TEXT NOT NULL,
-                completion TEXT NOT NULL,
+                messages TEXT NOT NULL,
                 metadata TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -81,77 +80,97 @@ class DatasetManager:
 
     def add_entry(
         self, 
-        prompt: str, 
-        completion: str,
+        messages: List[str],
         metadata: Optional[Dict] = None
     ) -> int:
-        """Add a Q&A entry to the dataset.
+        """Add a multi-turn conversation entry to the dataset.
 
         Args:
-            prompt: Question or prompt text
-            completion: Answer or completion text
+            messages: List of strings alternating between user and assistant messages.
+                     Must start with user and end with assistant.
+                     Example: ["user message 1", "assistant reply 1", "user message 2", "assistant reply 2"]
             metadata: Optional metadata (e.g., source location)
 
         Returns:
             Entry ID
         """
+        # Validate messages format
+        if not messages or len(messages) < 2:
+            raise ValueError("messages must contain at least one user-assistant pair")
+        if len(messages) % 2 != 0:
+            raise ValueError("messages must have even length (alternating user-assistant pairs)")
+        
+        # Build messages array in OpenAI format
+        formatted_messages = []
+        for i, content in enumerate(messages):
+            role = "user" if i % 2 == 0 else "assistant"
+            formatted_messages.append({"role": role, "content": content.strip()})
+        
         cursor = self.conn.cursor()
         metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
+        messages_json = json.dumps(formatted_messages, ensure_ascii=False)
 
-        duplicate = self.find_similar_entry(prompt, completion, DEFAULT_DUPLICATE_THRESHOLD)
+        duplicate = self.find_similar_entry(formatted_messages, DEFAULT_DUPLICATE_THRESHOLD)
         if duplicate:
             existing_entry = {
                 "id": duplicate["id"],
-                "prompt": duplicate["prompt"],
-                "completion": duplicate["completion"],
+                "messages": duplicate["messages"],
             }
             raise DuplicateEntryError(existing_entry, duplicate["similarity"])
 
         cursor.execute(
-            "INSERT INTO dataset (prompt, completion, metadata) VALUES (?, ?, ?)",
-            (prompt, completion, metadata_json)
+            "INSERT INTO dataset (messages, metadata) VALUES (?, ?)",
+            (messages_json, metadata_json)
         )
         self.conn.commit()
         return cursor.lastrowid
 
     def find_similar_entry(
         self,
-        prompt: str,
-        completion: str,
+        messages: List[Dict[str, str]],
         threshold: float = DEFAULT_DUPLICATE_THRESHOLD
     ) -> Optional[Dict[str, Any]]:
-        """Find an existing entry similar to the proposed prompt/completion pair.
+        """Find an existing entry similar to the proposed messages.
 
         Args:
-            prompt: Proposed question text
-            completion: Proposed answer text
+            messages: List of message dicts with 'role' and 'content' keys
             threshold: Similarity ratio threshold for duplicate detection
 
         Returns:
             Dictionary with existing entry info and similarity if found, otherwise None
         """
-        combined_candidate = f"{prompt.strip()}\n{completion.strip()}".strip().lower()
+        # Combine all messages content for comparison
+        combined_candidate = "\n".join(
+            f"{msg['role']}: {msg['content']}" for msg in messages
+        ).strip().lower()
+        
         if not combined_candidate:
             return None
 
         cursor = self.conn.cursor()
-        cursor.execute("SELECT id, prompt, completion FROM dataset")
+        cursor.execute("SELECT id, messages FROM dataset")
 
         best_match: Optional[Dict[str, Any]] = None
-        for entry_id, existing_prompt, existing_completion in cursor.fetchall():
-            combined_existing = f"{existing_prompt.strip()}\n{existing_completion.strip()}".strip().lower()
-            if not combined_existing:
-                continue
+        for entry_id, existing_messages_json in cursor.fetchall():
+            try:
+                existing_messages = json.loads(existing_messages_json)
+                combined_existing = "\n".join(
+                    f"{msg['role']}: {msg['content']}" for msg in existing_messages
+                ).strip().lower()
+                
+                if not combined_existing:
+                    continue
 
-            similarity = fuzz.ratio(combined_candidate, combined_existing)
-            if similarity >= threshold:
-                if not best_match or similarity > best_match["similarity"]:
-                    best_match = {
-                        "id": entry_id,
-                        "prompt": existing_prompt,
-                        "completion": existing_completion,
-                        "similarity": similarity,
-                    }
+                similarity = fuzz.ratio(combined_candidate, combined_existing)
+                if similarity >= threshold:
+                    if not best_match or similarity > best_match["similarity"]:
+                        best_match = {
+                            "id": entry_id,
+                            "messages": existing_messages,
+                            "similarity": similarity,
+                        }
+            except (json.JSONDecodeError, KeyError):
+                continue
 
         return best_match
 
@@ -166,7 +185,7 @@ class DatasetManager:
         """
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT id, prompt, completion, metadata, created_at FROM dataset WHERE id = ?",
+            "SELECT id, messages, metadata, created_at FROM dataset WHERE id = ?",
             (entry_id,)
         )
         row = cursor.fetchone()
@@ -174,10 +193,9 @@ class DatasetManager:
         if row:
             return {
                 "id": row[0],
-                "prompt": row[1],
-                "completion": row[2],
-                "metadata": json.loads(row[3]) if row[3] else None,
-                "created_at": row[4]
+                "messages": json.loads(row[1]),
+                "metadata": json.loads(row[2]) if row[2] else None,
+                "created_at": row[3]
             }
         return None
 
@@ -189,17 +207,16 @@ class DatasetManager:
         """
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT id, prompt, completion, metadata, created_at FROM dataset ORDER BY id"
+            "SELECT id, messages, metadata, created_at FROM dataset ORDER BY id"
         )
-        
+
         entries = []
         for row in cursor.fetchall():
             entries.append({
                 "id": row[0],
-                "prompt": row[1],
-                "completion": row[2],
-                "metadata": json.loads(row[3]) if row[3] else None,
-                "created_at": row[4]
+                "messages": json.loads(row[1]),
+                "metadata": json.loads(row[2]) if row[2] else None,
+                "created_at": row[3]
             })
         
         return entries
@@ -229,10 +246,9 @@ class DatasetManager:
         
         with output_file.open("w", encoding="utf-8") as f:
             for entry in entries:
-                # Write only prompt and completion (no metadata for simplicity)
+                # Write messages array
                 record = {
-                    "prompt": entry["prompt"],
-                    "completion": entry["completion"]
+                    "messages": entry["messages"]
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         
@@ -255,9 +271,9 @@ class DatasetManager:
             return 0
         
         # Prepare data for DataFrame
+        # Store messages as JSON string for Parquet compatibility
         data = {
-            "prompt": [e["prompt"] for e in entries],
-            "completion": [e["completion"] for e in entries]
+            "messages": [json.dumps(e["messages"], ensure_ascii=False) for e in entries]
         }
         
         if include_metadata:
@@ -291,9 +307,9 @@ class DatasetManager:
             return 0
         
         # Prepare data for DataFrame
+        # Store messages as JSON string for CSV compatibility
         data = {
-            "prompt": [e["prompt"] for e in entries],
-            "completion": [e["completion"] for e in entries]
+            "messages": [json.dumps(e["messages"], ensure_ascii=False) for e in entries]
         }
         
         if include_metadata:
@@ -321,9 +337,9 @@ class DatasetManager:
         entries = self.get_all_entries()
         
         if not include_metadata:
-            # Simplify entries to only prompt/completion
+            # Simplify entries to only messages
             entries = [
-                {"prompt": e["prompt"], "completion": e["completion"]}
+                {"messages": e["messages"]}
                 for e in entries
             ]
         
@@ -381,8 +397,8 @@ class DatasetManager:
             thread_id: Thread identifier
             start_position: Starting page/position
             current_position: Current page/position
-            submitted_count: Number of Q&A pairs submitted
-            target_count: Target number of Q&A pairs
+            submitted_count: Number of conversations submitted
+            target_count: Target number of conversations
             status: Thread status (running, completed, error)
             messages: Conversation history
         """
