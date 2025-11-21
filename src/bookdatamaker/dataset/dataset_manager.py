@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from rapidfuzz import fuzz
-
-import pandas as pd
+from datasets import Dataset
 
 
 DEFAULT_DUPLICATE_THRESHOLD = 85.0
@@ -251,7 +250,7 @@ class DatasetManager:
         return cursor.fetchone()[0]
 
     def export_jsonl(self, output_path: str) -> int:
-        """Export dataset to JSONL format.
+        """Export dataset to JSONL format using HuggingFace datasets.
 
         Args:
             output_path: Output file path
@@ -260,25 +259,26 @@ class DatasetManager:
             Number of entries exported
         """
         entries = self.get_all_entries()
+        
+        if not entries:
+            return 0
+        
+        # Convert to HuggingFace dataset
+        dataset = Dataset.from_dict({"messages": [e["messages"] for e in entries]})
+        
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
         
-        with output_file.open("w", encoding="utf-8") as f:
-            for entry in entries:
-                # Write messages array
-                record = {
-                    "messages": entry["messages"]
-                }
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        # Export using native method
+        dataset.to_json(str(output_file), orient="records", lines=True, force_ascii=False)
         
         return len(entries)
 
-    def export_parquet(self, output_path: str, include_metadata: bool = False, compression: str = 'zstd') -> int:
-        """Export dataset to Parquet format with configurable compression.
+    def export_parquet(self, output_path: str, compression: str = 'zstd') -> int:
+        """Export dataset to Parquet format using HuggingFace datasets.
 
         Args:
             output_path: Output file path
-            include_metadata: Whether to include metadata column
             compression: Compression method (zstd, snappy, gzip, brotli, none)
 
         Returns:
@@ -289,33 +289,23 @@ class DatasetManager:
         if not entries:
             return 0
         
-        # Prepare data for DataFrame
-        # Store messages as JSON string for Parquet compatibility
-        data = {
-            "messages": [json.dumps(e["messages"], ensure_ascii=False) for e in entries]
-        }
-        
-        if include_metadata:
-            data["metadata"] = [json.dumps(e["metadata"], ensure_ascii=False) if e["metadata"] else None for e in entries]
-            data["created_at"] = [e["created_at"] for e in entries]
-        
-        df = pd.DataFrame(data)
+        # Convert to HuggingFace dataset
+        dataset = Dataset.from_dict({"messages": [e["messages"] for e in entries]})
         
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
         
-        # Use pyarrow with specified compression
+        # Export using native method
         compression_value = None if compression.lower() == 'none' else compression.lower()
-        df.to_parquet(output_file, index=False, compression=compression_value, engine='pyarrow')
+        dataset.to_parquet(str(output_file), compression=compression_value)
         
         return len(entries)
 
-    def export_csv(self, output_path: str, include_metadata: bool = False) -> int:
-        """Export dataset to CSV format.
+    def export_csv(self, output_path: str) -> int:
+        """Export dataset to CSV format using HuggingFace datasets.
 
         Args:
             output_path: Output file path
-            include_metadata: Whether to include metadata column
 
         Returns:
             Number of entries exported
@@ -325,48 +315,42 @@ class DatasetManager:
         if not entries:
             return 0
         
-        # Prepare data for DataFrame
+        # Convert to HuggingFace dataset
         # Store messages as JSON string for CSV compatibility
-        data = {
+        dataset = Dataset.from_dict({
             "messages": [json.dumps(e["messages"], ensure_ascii=False) for e in entries]
-        }
-        
-        if include_metadata:
-            data["metadata"] = [json.dumps(e["metadata"], ensure_ascii=False) if e["metadata"] else None for e in entries]
-            data["created_at"] = [e["created_at"] for e in entries]
-        
-        df = pd.DataFrame(data)
+        })
         
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(output_file, index=False, encoding="utf-8")
+        
+        # Export using native method
+        dataset.to_csv(str(output_file), index=False)
         
         return len(entries)
 
-    def export_json(self, output_path: str, include_metadata: bool = False) -> int:
-        """Export dataset to JSON format.
+    def export_json(self, output_path: str) -> int:
+        """Export dataset to JSON format using HuggingFace datasets.
 
         Args:
             output_path: Output file path
-            include_metadata: Whether to include metadata
 
         Returns:
             Number of entries exported
         """
         entries = self.get_all_entries()
         
-        if not include_metadata:
-            # Simplify entries to only messages
-            entries = [
-                {"messages": e["messages"]}
-                for e in entries
-            ]
+        if not entries:
+            return 0
+        
+        # Convert to HuggingFace dataset
+        dataset = Dataset.from_dict({"messages": [e["messages"] for e in entries]})
         
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
         
-        with output_file.open("w", encoding="utf-8") as f:
-            json.dump(entries, f, ensure_ascii=False, indent=2)
+        # Export using native method (JSON array format)
+        dataset.to_json(str(output_file), orient="records", lines=False, force_ascii=False, indent=2)
         
         return len(entries)
 

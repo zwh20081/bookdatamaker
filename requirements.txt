@@ -3,7 +3,7 @@ httpx
 openai
 mcp
 pyarrow
-pandas
+datasets
 python-dotenv
 rich
 aiofiles

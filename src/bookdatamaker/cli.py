@@ -537,11 +537,6 @@ async def _run_mcp_server(
     help="Export format (default: auto-detect from file extension)",
 )
 @click.option(
-    "--include-metadata",
-    is_flag=True,
-    help="Include metadata and timestamps in export",
-)
-@click.option(
     "--compression",
     "-c",
     type=click.Choice(["zstd", "snappy", "gzip", "brotli", "none"], case_sensitive=False),
@@ -552,7 +547,6 @@ def export_dataset(
     db_file: Path,
     output: Path,
     format: str,
-    include_metadata: bool,
     compression: str
 ) -> None:
     """Export dataset from SQLite database to various formats.
@@ -568,7 +562,7 @@ def export_dataset(
     Examples:
         bookdatamaker export-dataset dataset.db -o output.jsonl
         bookdatamaker export-dataset dataset.db -o output.parquet -f parquet
-        bookdatamaker export-dataset dataset.db -o output.csv -f csv --include-metadata
+        bookdatamaker export-dataset dataset.db -o output.csv -f csv
     """
     from bookdatamaker.dataset import DatasetManager
     from bookdatamaker.utils import StatusIndicator
@@ -607,11 +601,11 @@ def export_dataset(
                 if format.lower() == "jsonl":
                     exported = dm.export_jsonl(str(output))
                 elif format.lower() == "parquet":
-                    exported = dm.export_parquet(str(output), include_metadata=include_metadata, compression=compression)
+                    exported = dm.export_parquet(str(output), compression=compression)
                 elif format.lower() == "csv":
-                    exported = dm.export_csv(str(output), include_metadata=include_metadata)
+                    exported = dm.export_csv(str(output))
                 elif format.lower() == "json":
-                    exported = dm.export_json(str(output), include_metadata=include_metadata)
+                    exported = dm.export_json(str(output))
                 else:
                     status.print_error(f"Unsupported format: {format}")
                     return
