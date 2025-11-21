@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -12,6 +13,8 @@ import pandas as pd
 
 
 DEFAULT_DUPLICATE_THRESHOLD = 85.0
+DEFAULT_RETRY_ATTEMPTS = 5
+DEFAULT_RETRY_DELAY = 0.1  # seconds
 
 
 class DuplicateEntryError(ValueError):
@@ -38,7 +41,15 @@ class DatasetManager:
         """
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path))
+        # Enable WAL mode for better concurrent access and set longer timeout
+        self.conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=30.0,  # 30 second timeout for locks
+            check_same_thread=False  # Allow usage from multiple threads
+        )
+        # Enable Write-Ahead Logging for better concurrency
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=30000")  # 30 second busy timeout
         self._create_table()
 
     def _create_table(self) -> None:
@@ -118,12 +129,20 @@ class DatasetManager:
             }
             raise DuplicateEntryError(existing_entry, duplicate["similarity"])
 
-        cursor.execute(
-            "INSERT INTO dataset (messages, metadata) VALUES (?, ?)",
-            (messages_json, metadata_json)
-        )
-        self.conn.commit()
-        return cursor.lastrowid
+        # Retry logic for database locked errors
+        for attempt in range(DEFAULT_RETRY_ATTEMPTS):
+            try:
+                cursor.execute(
+                    "INSERT INTO dataset (messages, metadata) VALUES (?, ?)",
+                    (messages_json, metadata_json)
+                )
+                self.conn.commit()
+                return cursor.lastrowid
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and attempt < DEFAULT_RETRY_ATTEMPTS - 1:
+                    time.sleep(DEFAULT_RETRY_DELAY * (attempt + 1))  # Exponential backoff
+                    continue
+                raise
 
     def find_similar_entry(
         self,
@@ -402,16 +421,25 @@ class DatasetManager:
             status: Thread status (running, completed, error)
             messages: Conversation history
         """
-        cursor = self.conn.cursor()
         messages_json = json.dumps(messages, ensure_ascii=False)
         
-        cursor.execute("""
-            INSERT OR REPLACE INTO thread_state 
-            (thread_id, start_position, current_position, submitted_count, target_count, status, messages, last_updated)
-            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        """, (thread_id, start_position, current_position, submitted_count, target_count, status, messages_json))
-        
-        self.conn.commit()
+        # Retry logic for database locked errors
+        for attempt in range(DEFAULT_RETRY_ATTEMPTS):
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                    INSERT OR REPLACE INTO thread_state 
+                    (thread_id, start_position, current_position, submitted_count, target_count, status, messages, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (thread_id, start_position, current_position, submitted_count, target_count, status, messages_json))
+                
+                self.conn.commit()
+                return
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and attempt < DEFAULT_RETRY_ATTEMPTS - 1:
+                    time.sleep(DEFAULT_RETRY_DELAY * (attempt + 1))
+                    continue
+                raise
     
     def get_thread_state(self, thread_id: int) -> Optional[Dict]:
         """Get thread state by ID.
@@ -483,12 +511,21 @@ class DatasetManager:
             key: Metadata key
             value: Metadata value
         """
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT OR REPLACE INTO session_metadata (key, value, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-        """, (key, value))
-        self.conn.commit()
+        # Retry logic for database locked errors
+        for attempt in range(DEFAULT_RETRY_ATTEMPTS):
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                    INSERT OR REPLACE INTO session_metadata (key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                """, (key, value))
+                self.conn.commit()
+                return
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and attempt < DEFAULT_RETRY_ATTEMPTS - 1:
+                    time.sleep(DEFAULT_RETRY_DELAY * (attempt + 1))
+                    continue
+                raise
     
     def get_session_metadata(self, key: str) -> Optional[str]:
         """Get session metadata.
