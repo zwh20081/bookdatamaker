@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bookdatamaker"
-version = "0.3.0.4"
+version = "0.3.0.5"
 description = "CLI tool for extracting text with DeepSeek OCR and generating datasets"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
