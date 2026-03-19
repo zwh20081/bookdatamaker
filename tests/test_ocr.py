@@ -1,5 +1,7 @@
 """Tests for OCR extractor."""
 
+import asyncio
+import json
 import pytest
 import tempfile
 from pathlib import Path
@@ -131,13 +133,13 @@ class TestPostProcessOCROutput:
             image = self._make_image(999, 999)
             result = ext._post_process_ocr_output(text, image, page_dir)
         
-            # Should have markdown image link
-            assert "![](images/1.jpg)" in result
+            # Should have markdown image link (0-based like model's infer())
+            assert "![](images/0.jpg)" in result
             # Should NOT have ref/det tags
             assert "<|ref|>" not in result
             assert "<|det|>" not in result
             # Image file should exist
-            assert (page_dir / "images" / "1.jpg").exists()
+            assert (page_dir / "images" / "0.jpg").exists()
 
     def test_non_image_ref_removed(self):
         """Non-image ref/det (e.g., title) should be removed entirely."""
@@ -150,8 +152,10 @@ class TestPostProcessOCROutput:
             result = ext._post_process_ocr_output(text, image, page_dir)
         
             assert "<|ref|>" not in result
-            # images dir should NOT exist (no image refs)
-            assert not (page_dir / "images").exists()
+            # images dir always exists (matching model.infer behavior)
+            assert (page_dir / "images").exists()
+            # But no cropped image files
+            assert not list((page_dir / "images").iterdir())
 
     def test_multiple_image_refs(self):
         """Multiple image refs should produce sequential numbered files."""
@@ -167,10 +171,10 @@ class TestPostProcessOCROutput:
             image = self._make_image(999, 999)
             result = ext._post_process_ocr_output(text, image, page_dir)
         
+            assert "![](images/0.jpg)" in result
             assert "![](images/1.jpg)" in result
-            assert "![](images/2.jpg)" in result
+            assert (page_dir / "images" / "0.jpg").exists()
             assert (page_dir / "images" / "1.jpg").exists()
-            assert (page_dir / "images" / "2.jpg").exists()
 
     def test_coordinate_scaling(self):
         """Coordinates should scale from 0-999 range to actual image dimensions."""
@@ -183,9 +187,9 @@ class TestPostProcessOCROutput:
             image = self._make_image(2000, 1000)
             result = ext._post_process_ocr_output(text, image, page_dir)
         
-            assert "![](images/1.jpg)" in result
+            assert "![](images/0.jpg)" in result
             # Verify cropped image exists and has reasonable dimensions
-            with Image.open(page_dir / "images" / "1.jpg") as cropped:
+            with Image.open(page_dir / "images" / "0.jpg") as cropped:
                 assert cropped.width > 0
                 assert cropped.height > 0
 
@@ -203,10 +207,193 @@ class TestPostProcessOCROutput:
             image = self._make_image(999, 999)
             result = ext._post_process_ocr_output(text, image, page_dir)
         
-            # Only 1 image ref → 1 cropped file
-            assert "![](images/1.jpg)" in result
-            assert (page_dir / "images" / "1.jpg").exists()
-            assert not (page_dir / "images" / "2.jpg").exists()
+            # Only 1 image ref → 1 cropped file (0-based)
+            assert "![](images/0.jpg)" in result
+            assert (page_dir / "images" / "0.jpg").exists()
+            assert not (page_dir / "images" / "1.jpg").exists()
             # No ref/det tags remain
             assert "<|ref|>" not in result
             assert "<|det|>" not in result
+
+
+class TestExtractionResume:
+    """Test extraction progress persistence and resume behavior."""
+
+    def test_extract_from_document_resumes_completed_pages(self, tmp_path):
+        extractor = OCRExtractor("fake-key", mode="local", skip_model_load=True, batch_size=2)
+        extractor.skip_model_load = False
+        document_path = tmp_path / "book.pdf"
+        document_path.write_bytes(b"%PDF-1.4")
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        page_1_dir = output_dir / "page_001"
+        page_1_dir.mkdir()
+        (page_1_dir / "result.mmd").write_text("page 1 existing", encoding="utf-8")
+
+        processed_batches = []
+
+        def fake_iter_document_pages(_path, prefer_text=False, start_page=1):
+            assert prefer_text is False
+            assert start_page == 1
+            for page_num in range(1, 4):
+                yield page_num, Image.new("RGB", (32, 32), color=(page_num, page_num, page_num))
+
+        async def fake_extract_batch(image_pages, current_output_dir=None, **_kwargs):
+            processed_batches.append([page_num for page_num, _ in image_pages])
+            results = []
+            for page_num, _ in image_pages:
+                page_dir = current_output_dir / f"page_{page_num:03d}"
+                page_dir.mkdir(parents=True, exist_ok=True)
+                (page_dir / "result.mmd").write_text(f"page {page_num}", encoding="utf-8")
+                results.append((page_num, f"page {page_num}"))
+            return results
+
+        with patch("bookdatamaker.ocr.document_parser.get_document_page_count", return_value=3), patch(
+            "bookdatamaker.ocr.document_parser.iter_document_pages",
+            side_effect=fake_iter_document_pages,
+        ), patch.object(extractor, "_extract_batch_from_images", side_effect=fake_extract_batch):
+            results = asyncio.run(
+                extractor.extract_from_document(document_path, prefer_text=False, output_dir=output_dir)
+            )
+
+        assert processed_batches == [[2, 3]]
+        assert results == [(1, "page 1 existing"), (2, "page 2"), (3, "page 3")]
+
+        progress = json.loads(
+            (output_dir / OCRExtractor.PROGRESS_FILE_NAME).read_text(encoding="utf-8")
+        )
+        assert progress["status"] == "completed"
+        assert progress["completed_pages"] == [1, 2, 3]
+
+    def test_extract_from_document_splits_local_batches(self, tmp_path):
+        extractor = OCRExtractor("fake-key", mode="local", skip_model_load=True, batch_size=2)
+        extractor.skip_model_load = False
+        document_path = tmp_path / "book.pdf"
+        document_path.write_bytes(b"%PDF-1.4")
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        processed_batches = []
+
+        def fake_iter_document_pages(_path, prefer_text=False, start_page=1):
+            assert prefer_text is False
+            assert start_page == 1
+            for page_num in range(1, 6):
+                yield page_num, Image.new("RGB", (32, 32), color=(page_num, page_num, page_num))
+
+        async def fake_extract_batch(image_pages, current_output_dir=None, **_kwargs):
+            processed_batches.append([page_num for page_num, _ in image_pages])
+            results = []
+            for page_num, _ in image_pages:
+                page_dir = current_output_dir / f"page_{page_num:03d}"
+                page_dir.mkdir(parents=True, exist_ok=True)
+                (page_dir / "result.mmd").write_text(f"page {page_num}", encoding="utf-8")
+                results.append((page_num, f"page {page_num}"))
+            return results
+
+        with patch("bookdatamaker.ocr.document_parser.get_document_page_count", return_value=5), patch(
+            "bookdatamaker.ocr.document_parser.iter_document_pages",
+            side_effect=fake_iter_document_pages,
+        ), patch.object(extractor, "_extract_batch_from_images", side_effect=fake_extract_batch):
+            results = asyncio.run(
+                extractor.extract_from_document(document_path, prefer_text=False, output_dir=output_dir)
+            )
+
+        assert processed_batches == [[1, 2], [3, 4], [5]]
+        assert [page_num for page_num, _ in results] == [1, 2, 3, 4, 5]
+
+    def test_extract_from_document_rejects_incompatible_progress(self, tmp_path):
+        extractor = OCRExtractor("fake-key", mode="local", skip_model_load=True, batch_size=2)
+        document_path = tmp_path / "book.pdf"
+        document_path.write_bytes(b"%PDF-1.4")
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        progress_path = output_dir / OCRExtractor.PROGRESS_FILE_NAME
+        progress_path.write_text(
+            json.dumps(
+                {
+                    "source_path": str((tmp_path / "other.pdf").resolve()),
+                    "mode": "local",
+                    "ocr_version": "2",
+                    "local_model_path": extractor.local_model_path,
+                    "device": "cuda",
+                    "batch_size": 2,
+                    "prefer_text": False,
+                    "total_pages": 3,
+                    "completed_pages": [1],
+                    "failed_pages": [],
+                    "status": "running",
+                    "last_error": None,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("bookdatamaker.ocr.document_parser.get_document_page_count", return_value=3):
+            with pytest.raises(ValueError, match="incompatible"):
+                asyncio.run(
+                    extractor.extract_from_document(document_path, prefer_text=False, output_dir=output_dir)
+                )
+
+    def test_batch_from_images_uses_batch_generate(self, tmp_path):
+        """batch_size > 1 should call _run_batch_generate (true batch inference)."""
+        extractor = OCRExtractor("fake-key", mode="local", skip_model_load=True, batch_size=3)
+        extractor.skip_model_load = False
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        batch_generate_calls = []
+
+        def fake_batch_generate(images, prompts):
+            batch_generate_calls.append(len(images))
+            return [f"text_{i}" for i in range(len(images))]
+
+        image_pages = [
+            (i, Image.new("RGB", (32, 32)))
+            for i in range(1, 6)
+        ]
+
+        with patch.object(extractor, "_run_batch_generate", side_effect=fake_batch_generate):
+            results = asyncio.run(
+                extractor._extract_batch_from_images(image_pages, output_dir=output_dir)
+            )
+
+        # batch_size=3 → batches of [3, 2]
+        assert batch_generate_calls == [3, 2]
+        assert len(results) == 5
+        # Each page should have result.mmd saved
+        for page_num in range(1, 6):
+            assert (output_dir / f"page_{page_num:03d}" / "result.mmd").exists()
+
+    def test_batch_size_one_uses_single_inference(self, tmp_path):
+        """batch_size == 1 should call _run_single_inference (model.infer with crop_mode)."""
+        extractor = OCRExtractor("fake-key", mode="local", skip_model_load=True, batch_size=1)
+        extractor.skip_model_load = False
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        single_calls = []
+
+        def fake_single_inference(image, prompt, page_num=None, output_dir=None):
+            single_calls.append(page_num)
+            if output_dir:
+                page_dir = output_dir / f"page_{page_num:03d}"
+                page_dir.mkdir(parents=True, exist_ok=True)
+                (page_dir / "result.mmd").write_text(f"text_{page_num}", encoding="utf-8")
+            return f"text_{page_num}"
+
+        image_pages = [
+            (i, Image.new("RGB", (32, 32)))
+            for i in range(1, 4)
+        ]
+
+        with patch.object(extractor, "_run_single_inference", side_effect=fake_single_inference):
+            results = asyncio.run(
+                extractor._extract_batch_from_images(image_pages, output_dir=output_dir)
+            )
+
+        assert single_calls == [1, 2, 3]
+        assert len(results) == 3

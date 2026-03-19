@@ -123,6 +123,52 @@ def extract(
     )
 
 
+def _rebuild_combined_output(output_dir: Path) -> Optional[Path]:
+    """Rebuild combined.txt from extracted page directories or flat text files."""
+    page_results = []
+    for page_dir in sorted(output_dir.glob("page_*")):
+        if not page_dir.is_dir():
+            continue
+        result_file = page_dir / "result.mmd"
+        if not result_file.exists():
+            continue
+        try:
+            page_num = int(page_dir.name.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        page_results.append((page_num, result_file.read_text(encoding="utf-8")))
+
+    if page_results:
+        combined_content = []
+        for page_num, content in page_results:
+            combined_content.append(f"[PAGE_{page_num:03d}]")
+            combined_content.append(content)
+            combined_content.append("")
+        combined_file = output_dir / "combined.txt"
+        combined_file.write_text("\n".join(combined_content), encoding="utf-8")
+        return combined_file
+
+    all_files = sorted(
+        txt_file
+        for txt_file in output_dir.glob("*.txt")
+        if txt_file.name != "combined.txt"
+    )
+    if not all_files:
+        return None
+
+    combined_content = []
+    for txt_file in all_files:
+        page_marker = txt_file.stem
+        content = txt_file.read_text(encoding="utf-8")
+        combined_content.append(f"[{page_marker.upper()}]")
+        combined_content.append(content)
+        combined_content.append("")
+
+    combined_file = output_dir / "combined.txt"
+    combined_file.write_text("\n".join(combined_content), encoding="utf-8")
+    return combined_file
+
+
 async def _extract_async(
     input_path: Path,
     output_dir: Path,
@@ -156,6 +202,16 @@ async def _extract_async(
         if mode == "local" and needs_ocr:
             status.print_info(f"Device: {device}")
         status.print_info(f"Extracting text from: {input_path}")
+
+        progress = None
+        if input_path.is_file() and input_path.suffix.lower() in [".pdf", ".epub"]:
+            progress = OCRExtractor.load_progress(output_dir)
+            if progress:
+                completed_pages = len(progress.get("completed_pages", []))
+                total_pages = progress.get("total_pages", 0)
+                status.print_info(
+                    f"Found existing extraction progress: {completed_pages}/{total_pages} pages completed"
+                )
 
         # Skip OCR model loading for plain text and EPUB
         async with OCRExtractor(
@@ -224,24 +280,9 @@ async def _extract_async(
 
                 status.print_success(f"Extracted {len(results)} files to: {output_dir}")
 
-            # Save combined text - load all pages into memory with page markers
-            all_files = sorted(output_dir.glob("*.txt"))
-
-            combined_content = []
-
-            for txt_file in all_files:
-                # Extract page number from filename (e.g., page_001.txt)
-                page_marker = txt_file.stem
-                content = txt_file.read_text(encoding="utf-8")
-
-                # Add page marker
-                combined_content.append(f"[{page_marker.upper()}]")
-                combined_content.append(content)
-                combined_content.append("")  # Empty line between pages
-
-            combined_file = output_dir / "combined.txt"
-            combined_file.write_text("\n".join(combined_content), encoding="utf-8")
-            status.print_success(f"Combined text with page markers saved to: {combined_file}")
+            combined_file = _rebuild_combined_output(output_dir)
+            if combined_file:
+                status.print_success(f"Combined text with page markers saved to: {combined_file}")
 
 
 @cli.command()

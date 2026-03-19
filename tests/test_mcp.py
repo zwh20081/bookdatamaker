@@ -103,7 +103,7 @@ class TestParagraphNavigator:
 
 
 class TestMCPImageTools:
-    """Test MCP server image tools (list_page_images, get_image)."""
+    """Test MCP server image tools (list_page_images)."""
 
     def _create_extracted_dir(self, tmpdir: Path, pages_with_images: dict = None):
         """Create a mock extracted directory structure.

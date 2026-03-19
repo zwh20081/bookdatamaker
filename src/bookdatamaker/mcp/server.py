@@ -553,7 +553,7 @@ class MCPServer:
                 tools.extend([
                     Tool(
                         name="list_page_images",
-                        description="List available images for a specific page, including cropped figures and the full page image",
+                        description="List available images for a specific page with absolute file paths, including cropped figures and the full page image",
                         inputSchema={
                             "type": "object",
                             "properties": {
@@ -577,7 +577,7 @@ class MCPServer:
                                 },
                                 "image_name": {
                                     "type": "string",
-                                    "description": "Image filename (e.g., '1.jpg' for cropped image, 'page_001.png' for full page)",
+                                    "description": "Image filename (e.g., 'images/0.jpg' for cropped image, 'page_001.png' for full page)",
                                 },
                             },
                             "required": ["page_number", "image_name"],
@@ -993,6 +993,7 @@ class MCPServer:
                         available_images.append({
                             "name": page_img.name,
                             "type": "full_page",
+                            "path": str(page_img.resolve()),
                         })
                         break
                 
@@ -1004,6 +1005,7 @@ class MCPServer:
                             available_images.append({
                                 "name": f"images/{img_file.name}",
                                 "type": "cropped",
+                                "path": str(img_file.resolve()),
                             })
                 
                 response = {

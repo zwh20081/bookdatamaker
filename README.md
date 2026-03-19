@@ -223,10 +223,16 @@ bookdatamaker extract ./images/ --mode local -o ./extracted
 ```
 
 **Performance Options:**
-- `--batch-size N`: Number of images to process in parallel (default: 8)
-  - Higher values = faster processing but more GPU memory
-  - Adjust based on available VRAM
+- `--batch-size N`: Number of pages processed per local OCR batch before flushing results to disk (default: 8)
+  - Higher values = higher throughput potential but more GPU/host memory pressure
+  - Lower values reduce memory spikes on long PDFs because pages are processed and persisted batch by batch
   - Example: 4 for 8GB VRAM, 8-16 for 24GB+ VRAM
+
+**Resume Behavior:**
+- Local and document extraction now persist progress in the output directory using `.extraction_progress.json`
+- Re-running the same command against the same output directory automatically resumes from unfinished pages
+- Existing `page_XXX/result.mmd` files are treated as completed pages and skipped
+- If source path or key extraction parameters change, the run is rejected to avoid mixing incompatible outputs
 
 **Device Options:**
 - `cuda` (default): Use default CUDA GPU

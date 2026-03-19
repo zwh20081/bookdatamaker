@@ -176,7 +176,8 @@ class ParallelDatasetGenerator:
             Pruned message list
         """
         if len(messages) <= keep_last + 1:
-            return messages
+            # Still sanitize even short lists (could have incomplete tool blocks)
+            return ParallelDatasetGenerator._sanitize_tool_pairs(messages)
         
         system_msg = messages[0] if messages and messages[0]["role"] == "system" else None
         start_idx = 1 if system_msg else 0
@@ -193,6 +194,54 @@ class ParallelDatasetGenerator:
             candidate = messages[cut_point:]
         
         result = ([system_msg] if system_msg else []) + candidate
+        # Validate all tool_call/tool_result pairs are complete
+        return ParallelDatasetGenerator._sanitize_tool_pairs(result)
+
+    @staticmethod
+    def _sanitize_tool_pairs(messages: list) -> list:
+        """Remove incomplete tool_call/tool_result groups from message list.
+        
+        Ensures every assistant message with tool_calls has ALL its
+        corresponding tool result messages immediately following it.
+        Drops any incomplete groups to prevent API errors.
+        
+        Args:
+            messages: Message list to sanitize
+            
+        Returns:
+            Sanitized message list with complete tool_call pairs only
+        """
+        result = []
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                # Collect expected tool_call_ids
+                tool_calls = msg["tool_calls"]
+                expected_ids = set()
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        expected_ids.add(tc["id"])
+                    else:
+                        expected_ids.add(tc.id)
+                
+                # Collect following tool result messages
+                j = i + 1
+                found_ids = set()
+                while j < len(messages) and messages[j].get("role") == "tool":
+                    found_ids.add(messages[j].get("tool_call_id"))
+                    j += 1
+                
+                if expected_ids <= found_ids:
+                    # Complete block — keep assistant + all tool results
+                    result.append(msg)
+                    for k in range(i + 1, j):
+                        result.append(messages[k])
+                # else: incomplete block — skip assistant + partial tool results
+                i = j
+            else:
+                result.append(msg)
+                i += 1
         return result
 
     def _log_llm_output(self, thread_id: int, content: str, tool_calls: list = None) -> None:
@@ -323,14 +372,26 @@ You have access to the following tools:
         # Add image tool descriptions if available
         if self.extracted_dir:
             base_prompt += """
-- list_page_images: List available images (cropped figures and full page) for a specific page
+- list_page_images: List available images for a specific page, returns absolute file paths"""
+            if not self.minimax_mcp:
+                base_prompt += """
 - get_image: Get a specific image as base64 data URL (use list_page_images first to see available images)"""
 
         # Add MiniMax MCP tool descriptions if available
         if self.minimax_mcp:
             base_prompt += """
 - minimax_web_search: Search the web for additional information about a topic
-- minimax_understand_image: Analyze and understand an image (accepts image URL or base64 data URL from get_image)"""
+- minimax_understand_image: Analyze and understand an image (pass the file path from list_page_images as image_url)"""
+
+        # Add image understanding workflow hint
+        if self.extracted_dir and self.minimax_mcp:
+            base_prompt += """
+
+# Image Understanding Workflow
+When you encounter image references (e.g., ![](images/0.jpg)) in page content:
+1. Call list_page_images to get available images with their absolute file paths
+2. Call minimax_understand_image with the file path as image_url to analyze the image
+3. Use the image analysis result to enrich your conversation dataset"""
 
         base_prompt += f"""
 
@@ -543,25 +604,26 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
 
         # Add image tools if extracted_dir is available
         if self.extracted_dir:
-            tools.extend([
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "list_page_images",
-                        "description": "List available images for a page (cropped figures and full page image)",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "page_number": {
-                                    "type": "integer",
-                                    "description": "Page number to list images for"
-                                }
-                            },
-                            "required": ["page_number"]
-                        }
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": "list_page_images",
+                    "description": "List available images for a page with absolute file paths (cropped figures and full page image)",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_number": {
+                                "type": "integer",
+                                "description": "Page number to list images for"
+                            }
+                        },
+                        "required": ["page_number"]
                     }
-                },
-                {
+                }
+            })
+            # get_image only available when NOT using minimax (minimax uses its own understand_image tool)
+            if not self.minimax_mcp:
+                tools.append({
                     "type": "function",
                     "function": {
                         "name": "get_image",
@@ -581,8 +643,7 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                             "required": ["page_number", "image_name"]
                         }
                     }
-                },
-            ])
+                })
 
         # Add MiniMax MCP tools if proxy is available
         if self.minimax_mcp:
@@ -616,14 +677,22 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                 dm.set_session_metadata("vllm_model_path", self.vllm_model_path)
         
         # Initialize MiniMax MCP proxy if key provided
+        # Run in a separate thread to avoid event loop conflicts
+        # (generate() is async, but MiniMaxMCPProxy uses its own sync event loops)
         if self.minimax_mcp_key:
-            from bookdatamaker.llm.minimax_mcp import MiniMaxMCPProxy
+            import concurrent.futures
+            def _init_minimax():
+                from bookdatamaker.llm.minimax_mcp import MiniMaxMCPProxy
+                proxy = MiniMaxMCPProxy(api_key=self.minimax_mcp_key)
+                proxy.get_openai_tool_defs()
+                return proxy
             try:
-                self.minimax_mcp = MiniMaxMCPProxy(api_key=self.minimax_mcp_key)
-                # Pre-fetch tool definitions to validate connection
-                self.minimax_mcp.get_openai_tool_defs()
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                future = executor.submit(_init_minimax)
+                self.minimax_mcp = future.result(timeout=30)
+                # Don't shutdown executor — MCP event loops live in its thread pool
             except Exception as e:
-                print(f"⚠️  Failed to initialize MiniMax MCP: {e}")
+                print(f"⚠️  Failed to initialize MiniMax MCP: {type(e).__name__}: {e}")
                 self.minimax_mcp = None
         
         # Initialize vLLM if needed (shared across threads)
@@ -1142,18 +1211,18 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                         for ext in (".png", ".jpg", ".jpeg"):
                                             page_img = page_dir / f"page_{page_num:03d}{ext}"
                                             if page_img.exists():
-                                                available.append({"name": page_img.name, "type": "full_page"})
+                                                available.append({"name": page_img.name, "type": "full_page", "path": str(page_img.resolve())})
                                                 break
                                         # Cropped images
                                         images_subdir = page_dir / "images"
                                         if images_subdir.is_dir():
                                             for img_file in sorted(images_subdir.iterdir()):
                                                 if img_file.suffix.lower() in (".jpg", ".jpeg", ".png"):
-                                                    available.append({"name": f"images/{img_file.name}", "type": "cropped"})
+                                                    available.append({"name": f"images/{img_file.name}", "type": "cropped", "path": str(img_file.resolve())})
                                         tool_result = json.dumps({"page_number": page_num, "image_count": len(available), "images": available}, ensure_ascii=False)
                                     self._log_tool_result(thread_id, function_name, {"page": page_num})
 
-                                elif function_name == "get_image" and self.extracted_dir:
+                                elif function_name == "get_image" and self.extracted_dir and not self.minimax_mcp:
                                     page_num = function_args["page_number"]
                                     image_name = function_args["image_name"]
                                     page_dir = self.extracted_dir / f"page_{page_num:03d}"
@@ -1224,8 +1293,23 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
 
                     except Exception as e:
                         error_str = str(e)
+                        
+                        # Rate limit (429): wait and retry without modifying messages
+                        if "429" in error_str or "rate_limit" in error_str:
+                            import random
+                            jitter = random.uniform(1, 8)
+                            retry_delay = max(self.api_delay, 10) + jitter
+                            with self.log_lock:
+                                tqdm.write(f"[Thread {thread_id}] ⏳ Rate limited, waiting {retry_delay:.1f}s before retry...")
+                            time.sleep(retry_delay)
+                            continue
+                        
                         with self.log_lock:
                             tqdm.write(f"[Thread {thread_id}] ❌ Error: {error_str[:300]}")
+                        
+                        # First: sanitize any incomplete tool_call groups
+                        # (could happen if exception occurred mid-tool-processing)
+                        messages = self._sanitize_tool_pairs(messages)
                         
                         # If API returns 400 bad_request, likely message format issue
                         # Aggressively prune history to recover
