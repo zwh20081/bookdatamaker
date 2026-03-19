@@ -709,6 +709,103 @@ def export_dataset(
 
 
 @cli.command()
+@click.argument("input_file", type=click.Path(exists=True, path_type=Path))
+@click.argument("output_file", type=click.Path(path_type=Path))
+@click.option(
+    "--compression",
+    "-c",
+    type=click.Choice(["zstd", "snappy", "gzip", "brotli", "none"], case_sensitive=False),
+    default="zstd",
+    help="Compression method for Parquet output (default: zstd)",
+)
+def convert(
+    input_file: Path,
+    output_file: Path,
+    compression: str,
+) -> None:
+    """Convert dataset between formats (parquet, jsonl, csv, json).
+
+    INPUT_FILE: Source file (parquet/jsonl/csv/json)
+    OUTPUT_FILE: Destination file (format auto-detected from extension)
+
+    Examples:
+        bookdatamaker convert data.parquet data.jsonl
+        bookdatamaker convert data.jsonl data.csv
+        bookdatamaker convert data.csv data.parquet -c snappy
+    """
+    from datasets import Dataset
+    from bookdatamaker.utils import StatusIndicator
+
+    FORMAT_MAP = {
+        ".jsonl": "jsonl",
+        ".parquet": "parquet",
+        ".csv": "csv",
+        ".json": "json",
+    }
+
+    with StatusIndicator() as status:
+        in_ext = input_file.suffix.lower()
+        out_ext = output_file.suffix.lower()
+        in_fmt = FORMAT_MAP.get(in_ext)
+        out_fmt = FORMAT_MAP.get(out_ext)
+
+        if in_fmt is None:
+            status.print_error(f"Unsupported input format: {in_ext}  (supported: {', '.join(FORMAT_MAP.keys())})")
+            raise click.Abort()
+        if out_fmt is None:
+            status.print_error(f"Unsupported output format: {out_ext}  (supported: {', '.join(FORMAT_MAP.keys())})")
+            raise click.Abort()
+
+        status.print_info(f"Converting {in_fmt.upper()} → {out_fmt.upper()}")
+        status.print_info(f"  Input:  {input_file}")
+        status.print_info(f"  Output: {output_file}")
+
+        try:
+            # --- Load ---
+            if in_fmt == "parquet":
+                ds = Dataset.from_parquet(str(input_file))
+            elif in_fmt == "jsonl":
+                ds = Dataset.from_json(str(input_file))
+            elif in_fmt == "csv":
+                ds = Dataset.from_csv(str(input_file))
+            elif in_fmt == "json":
+                ds = Dataset.from_json(str(input_file))
+
+            status.print_info(f"Loaded {len(ds)} entries")
+
+            # --- Save ---
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+
+            if out_fmt == "parquet":
+                if compression.lower() == "none":
+                    ds.to_parquet(str(output_file))
+                else:
+                    ds.to_parquet(str(output_file))
+                status.print_info(f"Compression: {compression}")
+            elif out_fmt == "jsonl":
+                ds.to_json(str(output_file), orient="records", lines=True, force_ascii=False)
+            elif out_fmt == "csv":
+                ds.to_csv(str(output_file), index=False)
+            elif out_fmt == "json":
+                ds.to_json(str(output_file), orient="records", lines=False, force_ascii=False)
+
+            # File size
+            file_size = output_file.stat().st_size
+            if file_size < 1024:
+                size_str = f"{file_size} bytes"
+            elif file_size < 1024 * 1024:
+                size_str = f"{file_size / 1024:.2f} KB"
+            else:
+                size_str = f"{file_size / (1024 * 1024):.2f} MB"
+
+            status.print_success(f"Converted {len(ds)} entries → {output_file}  ({size_str})")
+
+        except Exception as e:
+            status.print_error(f"Conversion failed: {e}")
+            raise click.Abort()
+
+
+@cli.command()
 @click.argument("extracted_dir", type=click.Path(exists=True, path_type=Path))
 @click.option(
     "--db",
