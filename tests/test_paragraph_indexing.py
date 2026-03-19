@@ -32,7 +32,7 @@ def test_paragraph_indexing():
         pm = PageManager.from_combined_file(temp_file)
 
         # 验证基本统计
-        assert pm.total_pages == 2
+        assert pm.get_total_pages() == 2
         assert pm.total_lines > 0
         assert pm.total_paragraphs >= 4  # 至少4个段落
 

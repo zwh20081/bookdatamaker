@@ -8,6 +8,7 @@ from typing import Optional
 import click
 from dotenv import load_dotenv
 
+import bookdatamaker
 from bookdatamaker.dataset import DatasetManager
 from bookdatamaker.mcp import create_mcp_server
 from bookdatamaker.ocr import OCRExtractor
@@ -15,7 +16,7 @@ from bookdatamaker.utils import PageManager
 
 
 @click.group(invoke_without_command=True)
-@click.version_option(version="0.1.0")
+@click.version_option(version=bookdatamaker.__version__)
 @click.pass_context
 def cli(ctx: click.Context) -> None:
     """Book Data Maker - Extract text and generate datasets."""
@@ -53,10 +54,16 @@ def cli(ctx: click.Context) -> None:
     help="vLLM API URL (default: http://localhost:8000/v1)",
 )
 @click.option(
+    "--ocr-version",
+    type=click.Choice(["1", "2"]),
+    default="2",
+    help="DeepSeek OCR model version: '1' for OCR-1, '2' for OCR-2 (default: 2)",
+)
+@click.option(
     "--local-model-path",
     envvar="LOCAL_OCR_MODEL",
-    default="deepseek-ai/DeepSeek-OCR",
-    help="Path to local OCR model for transformers (default: deepseek-ai/DeepSeek-OCR)",
+    default=None,
+    help="Path to local OCR model (overrides --ocr-version default). Auto-detected if not set.",
 )
 @click.option(
     "--batch-size",
@@ -88,7 +95,8 @@ def extract(
     mode: str,
     deepseek_api_key: Optional[str],
     deepseek_api_url: str,
-    local_model_path: str,
+    ocr_version: str,
+    local_model_path: Optional[str],
     batch_size: int,
     api_concurrency: int,
     device: str,
@@ -105,6 +113,7 @@ def extract(
             mode,
             deepseek_api_key,
             deepseek_api_url,
+            ocr_version,
             local_model_path,
             batch_size,
             api_concurrency,
@@ -120,7 +129,8 @@ async def _extract_async(
     mode: str,
     api_key: Optional[str],
     api_url: str,
-    local_model_path: str,
+    ocr_version: str,
+    local_model_path: Optional[str],
     batch_size: int,
     api_concurrency: int,
     device: str,
@@ -157,6 +167,7 @@ async def _extract_async(
             api_concurrency=api_concurrency,
             device=device,
             skip_model_load=not needs_ocr,
+            ocr_version=ocr_version,
         ) as extractor:
             if input_path.is_file():
                 # Check if it's a document (PDF/EPUB) or image
@@ -313,6 +324,12 @@ async def _extract_async(
     default=0.0,
     help="Delay in seconds between API requests (API mode only). Use to avoid rate limits. Example: 0.5 for 500ms delay.",
 )
+@click.option(
+    "--minimax-mcp-key",
+    envvar="MINIMAX_MCP_KEY",
+    default=None,
+    help="MiniMax API key for MCP tools (web_search, understand_image). Auto-enabled when model name contains 'MiniMax'. Can also set MINIMAX_MCP_KEY env var.",
+)
 def generate(
     extracted_dir: Path,
     db: Path,
@@ -329,6 +346,7 @@ def generate(
     tool_call_parser: Optional[str],
     max_messages: Optional[int],
     api_delay: float,
+    minimax_mcp_key: Optional[str],
 ) -> None:
     """Generate dataset using parallel LLM threads with MCP navigation.
 
@@ -374,6 +392,7 @@ def generate(
             tool_call_parser,
             max_messages,
             api_delay,
+            minimax_mcp_key,
         )
     )
 
@@ -394,6 +413,7 @@ async def _generate_async(
     tool_call_parser: Optional[str],
     max_messages: Optional[int],
     api_delay: float,
+    minimax_mcp_key: Optional[str],
 ) -> None:
     """Async implementation of parallel dataset generation."""
     from bookdatamaker.llm.parallel_generator import ParallelDatasetGenerator
@@ -418,14 +438,29 @@ async def _generate_async(
                         click.echo("Aborted.")
                         return
 
-    click.echo(f"Loading pages from directory: {extracted_dir}")
+    click.echo(f"Loading pages from: {extracted_dir}")
     
-    # Load pages from directory
-    page_manager = PageManager.from_directory(extracted_dir)
+    # Load pages - detect if input is a file or directory
+    extracted_path = Path(extracted_dir)
+    if extracted_path.is_file():
+        click.echo(f"  Detected file input, loading as combined file...")
+        page_manager = PageManager.from_combined_file(extracted_path)
+        # For image tools, use the parent directory
+        extracted_dir = extracted_path.parent
+    else:
+        page_manager = PageManager.from_directory(extracted_path)
     total_paragraphs = page_manager.total_paragraphs
     total_pages = page_manager.get_total_pages()
     
     click.echo(f"✓ Loaded {total_pages} pages, {total_paragraphs} paragraphs")
+
+    # Auto-detect MiniMax MCP: if model contains 'minimax' (case-insensitive) and key available
+    if minimax_mcp_key is None and model and "minimax" in model.lower():
+        # Try using the openai_api_key as MiniMax key (same platform)
+        minimax_mcp_key = openai_api_key
+    
+    if minimax_mcp_key and model and "minimax" in model.lower():
+        click.echo(f"✓ MiniMax MCP tools enabled (web_search, understand_image)")
 
     # Initialize parallel generator
     generator = ParallelDatasetGenerator(
@@ -444,6 +479,8 @@ async def _generate_async(
         tool_call_parser=tool_call_parser,
         max_messages=max_messages,
         api_delay=api_delay,
+        extracted_dir=extracted_dir,
+        minimax_mcp_key=minimax_mcp_key,
     )
 
     click.echo(f"\nStarting {generator.num_threads} parallel threads")
@@ -499,7 +536,7 @@ def mcp_server(extracted_dir: Path, db: Path) -> None:
         click.echo("\nStarting MCP server with page navigation support...")
         click.echo("Use Ctrl+C to stop the server\n")
         
-        asyncio.run(_run_mcp_server(page_manager=page_manager, db_path=str(db)))
+        asyncio.run(_run_mcp_server(page_manager=page_manager, db_path=str(db), extracted_dir=extracted_dir))
 
     except Exception as e:
         click.echo(f"✗ Failed to load document: {e}")
@@ -509,13 +546,15 @@ def mcp_server(extracted_dir: Path, db: Path) -> None:
 async def _run_mcp_server(
     paragraphs: Optional[list[str]] = None,
     page_manager: Optional[PageManager] = None,
-    db_path: Optional[str] = None
+    db_path: Optional[str] = None,
+    extracted_dir: Optional[Path] = None
 ) -> None:
     """Run MCP server."""
     server = await create_mcp_server(
         paragraphs=paragraphs, 
         page_manager=page_manager,
-        db_path=db_path
+        db_path=db_path,
+        extracted_dir=extracted_dir
     )
     await server.run()
 

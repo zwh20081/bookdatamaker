@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bookdatamaker"
-version = "0.3.0.6"
+version = "0.4.0"
 description = "CLI tool for extracting text with DeepSeek OCR and generating datasets"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -33,11 +33,24 @@ dependencies = [
 [project.optional-dependencies]
 local = [
     "transformers==4.46.3",
+    "tokenizers==0.20.3",
+    "torch",
+    "einops",
+    "easydict",
+    "addict",
+    "img2pdf",
+    "numpy",
+]
+local-flash = [
+    "transformers==4.46.3",
+    "tokenizers==0.20.3",
     "torch",
     "flash-attn",
     "einops",
     "easydict",
     "addict",
+    "img2pdf",
+    "numpy",
 ]
 document = [
     "PyMuPDF",
@@ -46,11 +59,13 @@ document = [
 ]
 all = [
     "transformers==4.46.3",
+    "tokenizers==0.20.3",
     "torch",
-    "flash-attn",
     "einops",
     "easydict",
     "addict",
+    "img2pdf",
+    "numpy",
     "PyMuPDF",
     "ebooklib",
     "beautifulsoup4",

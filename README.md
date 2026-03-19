@@ -24,7 +24,8 @@ A powerful CLI tool for extracting text from documents using DeepSeek OCR and ge
 ## Features
 
 - 📄 **Multi-Format Support**: PDF, EPUB, and images
-- 🏠 **Self-Hosted OCR**: Local transformers for DeepSeek-OCR (no API costs)
+- 🏠 **Self-Hosted OCR**: Local transformers for DeepSeek-OCR / DeepSeek-OCR-2 (no API costs)
+- 🔄 **OCR Version Choice**: Switch between DeepSeek-OCR-1 and OCR-2 via `--ocr-version`
 - 🤖 **Parallel Generation**: Multiple LLM threads explore documents simultaneously
 - 🎯 **Smart Distribution**: Control thread starting positions
 - 💾 **SQLite Storage**: Real-time dataset storage with flexible export
@@ -58,7 +59,7 @@ pip install bookdatamaker[local]  # From PyPI
 pip install -e ".[local]"  # From source - installs transformers==4.46.3, torch, flash-attn, etc.
 ```
 
-**Note**: The project requires `transformers==4.46.3` for optimal compatibility with DeepSeek-OCR. A warning will be displayed if a different version is detected.
+**Note**: The project requires `transformers==4.46.3` for optimal compatibility with DeepSeek-OCR and DeepSeek-OCR-2. A warning will be displayed if a different version is detected.
 
 ### System Requirements
 
@@ -91,10 +92,13 @@ export DEEPSEEK_API_KEY=your_deepseek_key    # For API OCR mode
 # 1. Install
 pip install bookdatamaker
 
-# 2. Extract → Generate → Export
+# 2. Extract (uses DeepSeek-OCR-2 by default) → Generate → Export
 bookdatamaker extract book.pdf -o ./extracted
 bookdatamaker generate ./extracted -d dataset.db --distribution "10,10,20,30,20,10"
 bookdatamaker export-dataset dataset.db -o output.parquet
+
+# Use OCR-1 instead
+bookdatamaker extract book.pdf --ocr-version 1 -o ./extracted
 ```
 
 ### Option 2: Self-Hosted Mode (Free, Private)
@@ -137,6 +141,25 @@ bookdatamaker export-dataset dataset.db -o output.parquet
 ## Extract Text (Stage 1)
 
 Extract text from documents using DeepSeek OCR.
+
+### OCR Version
+
+By default, **DeepSeek-OCR-2** is used. You can switch to OCR-1 with `--ocr-version 1`:
+
+```bash
+# OCR-2 (default) — better accuracy, image_size=768
+bookdatamaker extract book.pdf -o ./extracted
+
+# OCR-1 — legacy, image_size=640
+bookdatamaker extract book.pdf --ocr-version 1 -o ./extracted
+```
+
+| Feature | OCR-1 | OCR-2 |
+|---------|-------|-------|
+| Model | `deepseek-ai/DeepSeek-OCR` | `deepseek-ai/DeepSeek-OCR-2` |
+| image_size | 640 | 768 |
+| flash_attention_2 | No | Yes |
+| API ngram_size | 30 | 20 |
 
 ### Supported Formats
 

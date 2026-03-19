@@ -84,6 +84,8 @@ class ParallelDatasetGenerator:
         tool_call_parser: Optional[str] = None,
         max_messages: Optional[int] = None,
         api_delay: float = 0.0,
+        extracted_dir: Optional[Path] = None,
+        minimax_mcp_key: Optional[str] = None,
     ) -> None:
         """Initialize parallel dataset generator.
 
@@ -103,6 +105,8 @@ class ParallelDatasetGenerator:
             tool_call_parser: Tool call parser name for vLLM (required for vLLM mode)
             max_messages: Maximum message history to keep (None = unlimited)
             api_delay: Delay in seconds between API requests (default: 0.0)
+            extracted_dir: Path to extracted directory for image access (optional)
+            minimax_mcp_key: MiniMax API key for MCP tools (optional)
         """
         self.page_manager = page_manager
         self.db_path = db_path
@@ -120,6 +124,9 @@ class ParallelDatasetGenerator:
         self.tool_call_parser = tool_call_parser
         self.max_messages = max_messages
         self.api_delay = api_delay
+        self.extracted_dir = Path(extracted_dir) if extracted_dir else None
+        self.minimax_mcp_key = minimax_mcp_key
+        self.minimax_mcp = None  # Initialized lazily in generate()
         self.vllm_llm = None  # Will be initialized if using vLLM mode
         
         # Progress tracking
@@ -140,19 +147,71 @@ class ParallelDatasetGenerator:
                 self.pbar.update(increment)
                 self.current_progress += increment
     
+    @staticmethod
+    def _extract_think(content: str):
+        """Extract <think> blocks and remaining text from content.
+        
+        Returns:
+            (think_text, visible_text) where think_text is the concatenated
+            content inside <think> tags (or empty string) and visible_text
+            is the remaining content.
+        """
+        import re
+        think_parts = re.findall(r'<think>(.*?)</think>', content, re.DOTALL)
+        visible = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        return '\n'.join(t.strip() for t in think_parts if t.strip()), visible
+
+    @staticmethod
+    def _safe_prune_messages(messages: list, keep_last: int = 10) -> list:
+        """Prune messages while keeping system msg and avoiding orphaned tool_calls.
+        
+        Ensures that assistant messages with tool_calls always have their
+        corresponding tool response messages, which many APIs require.
+        
+        Args:
+            messages: Full message list
+            keep_last: Target number of recent messages to keep
+            
+        Returns:
+            Pruned message list
+        """
+        if len(messages) <= keep_last + 1:
+            return messages
+        
+        system_msg = messages[0] if messages and messages[0]["role"] == "system" else None
+        start_idx = 1 if system_msg else 0
+        
+        # Take the last keep_last messages
+        candidate = messages[-keep_last:]
+        
+        # If the first message is a "tool" role, we need to find the preceding
+        # assistant message with tool_calls. Walk backwards from the cut point
+        # to include the full tool_calls group.
+        cut_point = len(messages) - keep_last
+        while candidate and candidate[0].get("role") == "tool" and cut_point > start_idx:
+            cut_point -= 1
+            candidate = messages[cut_point:]
+        
+        result = ([system_msg] if system_msg else []) + candidate
+        return result
+
     def _log_llm_output(self, thread_id: int, content: str, tool_calls: list = None) -> None:
         """Log LLM output in a thread-safe manner.
         
         Args:
             thread_id: Thread identifier
-            content: LLM response content
+            content: LLM response content (may contain <think> tags)
             tool_calls: List of tool calls made by LLM
         """
         with self.log_lock:
             if content and content.strip():
-                # Show condensed content (first 100 chars)
-                short_content = content[:100] + "..." if len(content) > 100 else content
-                tqdm.write(f"[Thread {thread_id}] LLM: {short_content}")
+                think_text, visible_text = self._extract_think(content)
+                if think_text:
+                    short_think = think_text[:150] + "..." if len(think_text) > 150 else think_text
+                    tqdm.write(f"[Thread {thread_id}] 💭 Think: {short_think}")
+                if visible_text:
+                    short_content = visible_text[:100] + "..." if len(visible_text) > 100 else visible_text
+                    tqdm.write(f"[Thread {thread_id}] LLM: {short_content}")
             
             if tool_calls:
                 for tool_call in tool_calls:
@@ -259,7 +318,21 @@ You have access to the following tools:
 - get_page_context: Get current page with surrounding pages for context
 - submit_dataset: Submit a multi-turn conversation to the dataset (see format below)
 - exit: Exit the session after completing all submissions
-- get_page_access_summary: View global coverage stats and find pages with the fewest visits
+- get_page_access_summary: View global coverage stats and find pages with the fewest visits"""
+
+        # Add image tool descriptions if available
+        if self.extracted_dir:
+            base_prompt += """
+- list_page_images: List available images (cropped figures and full page) for a specific page
+- get_image: Get a specific image as base64 data URL (use list_page_images first to see available images)"""
+
+        # Add MiniMax MCP tool descriptions if available
+        if self.minimax_mcp:
+            base_prompt += """
+- minimax_web_search: Search the web for additional information about a topic
+- minimax_understand_image: Analyze and understand an image (accepts image URL or base64 data URL from get_image)"""
+
+        base_prompt += f"""
 
 # Multi-Turn Conversation Format
 When calling submit_dataset, provide a "messages" array with alternating user/assistant messages:
@@ -344,7 +417,7 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
         Returns:
             List of tool definitions
         """
-        return [
+        tools = [
             {
                 "type": "function",
                 "function": {
@@ -468,6 +541,55 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
             }
         ]
 
+        # Add image tools if extracted_dir is available
+        if self.extracted_dir:
+            tools.extend([
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "list_page_images",
+                        "description": "List available images for a page (cropped figures and full page image)",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "page_number": {
+                                    "type": "integer",
+                                    "description": "Page number to list images for"
+                                }
+                            },
+                            "required": ["page_number"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_image",
+                        "description": "Get a specific image as base64. Use list_page_images first to see available images.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "page_number": {
+                                    "type": "integer",
+                                    "description": "Page number"
+                                },
+                                "image_name": {
+                                    "type": "string",
+                                    "description": "Image filename (e.g., 'images/1.jpg' for cropped, 'page_001.png' for full page)"
+                                }
+                            },
+                            "required": ["page_number", "image_name"]
+                        }
+                    }
+                },
+            ])
+
+        # Add MiniMax MCP tools if proxy is available
+        if self.minimax_mcp:
+            tools.extend(self.minimax_mcp.get_openai_tool_defs())
+
+        return tools
+
     async def generate(self) -> int:
         """Run parallel dataset generation.
 
@@ -492,6 +614,17 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                 dm.set_session_metadata("model", self.model)
             if self.vllm_model_path:
                 dm.set_session_metadata("vllm_model_path", self.vllm_model_path)
+        
+        # Initialize MiniMax MCP proxy if key provided
+        if self.minimax_mcp_key:
+            from bookdatamaker.llm.minimax_mcp import MiniMaxMCPProxy
+            try:
+                self.minimax_mcp = MiniMaxMCPProxy(api_key=self.minimax_mcp_key)
+                # Pre-fetch tool definitions to validate connection
+                self.minimax_mcp.get_openai_tool_defs()
+            except Exception as e:
+                print(f"⚠️  Failed to initialize MiniMax MCP: {e}")
+                self.minimax_mcp = None
         
         # Initialize vLLM if needed (shared across threads)
         if self.mode == "vllm":
@@ -577,6 +710,10 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
         # Close progress bar
         self.pbar.close()
         
+        # Clean up MiniMax MCP proxy
+        if self.minimax_mcp:
+            self.minimax_mcp.close()
+        
         # Aggregate results
         total_generated = sum(r["submitted"] for r in results)
         
@@ -651,18 +788,12 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                     submitted_count = saved_state["submitted_count"]
                     messages = saved_state["messages"]
                     
-                    # Prune message history if limit specified and exceeded
-                    if self.max_messages and len(messages) > self.max_messages:
-                        system_msg = messages[0] if messages and messages[0]["role"] == "system" else None
-                        recent_messages = messages[-10:]
-                        
-                        if system_msg:
-                            messages = [system_msg] + recent_messages
-                        else:
-                            messages = recent_messages
-                        
+                    # Prune message history: use max_messages or default cap of 40
+                    prune_limit = self.max_messages or 40
+                    if len(messages) > prune_limit:
+                        messages = self._safe_prune_messages(messages, keep_last=10)
                         with self.log_lock:
-                            tqdm.write(f"[Thread {thread_id}] ✂️  Pruned restored message history to {len(messages)} messages (kept system + last 10)")
+                            tqdm.write(f"[Thread {thread_id}] ✂️  Pruned restored message history to {len(messages)} messages")
                     
                     with self.log_lock:
                         tqdm.write(f"[Thread {thread_id}] 🔄 Resuming from checkpoint: {submitted_count}/{self.datasets_per_thread} pairs completed, at page {current_position}")
@@ -712,17 +843,9 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                     try:
                         # Prune message history if limit specified and exceeded
                         if self.max_messages and len(messages) > self.max_messages:
-                            # Keep system message + last 10 messages
-                            system_msg = messages[0] if messages and messages[0]["role"] == "system" else None
-                            recent_messages = messages[-10:]
-                            
-                            if system_msg:
-                                messages = [system_msg] + recent_messages
-                            else:
-                                messages = recent_messages
-                            
+                            messages = self._safe_prune_messages(messages, keep_last=10)
                             with self.log_lock:
-                                tqdm.write(f"[Thread {thread_id}] ✂️  Pruned message history to {len(messages)} messages (kept system + last 10)")
+                                tqdm.write(f"[Thread {thread_id}] ✂️  Pruned message history to {len(messages)} messages")
                         
                         # Log conversation length for debugging
                         if iteration % 5 == 0:
@@ -1008,6 +1131,65 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                         tool_result = f"Error: Could not get page context"
                                         self._log_tool_result(thread_id, function_name, {"error": "Could not get context"})
                                     
+                                elif function_name == "list_page_images" and self.extracted_dir:
+                                    page_num = function_args["page_number"]
+                                    page_dir = self.extracted_dir / f"page_{page_num:03d}"
+                                    if not page_dir.is_dir():
+                                        tool_result = f"Page {page_num} not found"
+                                    else:
+                                        available = []
+                                        # Full page image
+                                        for ext in (".png", ".jpg", ".jpeg"):
+                                            page_img = page_dir / f"page_{page_num:03d}{ext}"
+                                            if page_img.exists():
+                                                available.append({"name": page_img.name, "type": "full_page"})
+                                                break
+                                        # Cropped images
+                                        images_subdir = page_dir / "images"
+                                        if images_subdir.is_dir():
+                                            for img_file in sorted(images_subdir.iterdir()):
+                                                if img_file.suffix.lower() in (".jpg", ".jpeg", ".png"):
+                                                    available.append({"name": f"images/{img_file.name}", "type": "cropped"})
+                                        tool_result = json.dumps({"page_number": page_num, "image_count": len(available), "images": available}, ensure_ascii=False)
+                                    self._log_tool_result(thread_id, function_name, {"page": page_num})
+
+                                elif function_name == "get_image" and self.extracted_dir:
+                                    page_num = function_args["page_number"]
+                                    image_name = function_args["image_name"]
+                                    page_dir = self.extracted_dir / f"page_{page_num:03d}"
+                                    if not page_dir.is_dir():
+                                        tool_result = f"Page {page_num} not found"
+                                    else:
+                                        image_path = page_dir / image_name
+                                        # Security: ensure path stays within page_dir
+                                        try:
+                                            image_path.resolve().relative_to(page_dir.resolve())
+                                        except ValueError:
+                                            image_path = None
+                                        
+                                        if image_path and image_path.exists():
+                                            import base64 as b64
+                                            from PIL import Image
+                                            import io as sio
+                                            with Image.open(image_path) as img:
+                                                if img.mode != "RGB":
+                                                    img = img.convert("RGB")
+                                                buf = sio.BytesIO()
+                                                img.save(buf, format="JPEG")
+                                                b64_str = b64.b64encode(buf.getvalue()).decode("utf-8")
+                                            data_url = f"data:image/jpeg;base64,{b64_str}"
+                                            tool_result = json.dumps({"page_number": page_num, "image_name": image_name, "data_url": data_url}, ensure_ascii=False)
+                                        else:
+                                            tool_result = f"Image '{image_name}' not found in page {page_num}"
+                                    self._log_tool_result(thread_id, function_name, {"page": page_num, "image": image_name})
+
+                                elif self.minimax_mcp and self.minimax_mcp.is_minimax_tool(function_name):
+                                    try:
+                                        tool_result = self.minimax_mcp.call_tool(thread_id, function_name, function_args)
+                                    except Exception as mcp_err:
+                                        tool_result = f"Error calling {function_name}: {mcp_err}"
+                                    self._log_tool_result(thread_id, function_name, {"result_preview": str(tool_result)[:80]})
+
                                 else:
                                     tool_result = f"Error: Unknown tool {function_name}"
                                     self._log_tool_result(thread_id, function_name, {"error": tool_result})
@@ -1041,10 +1223,19 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                 no_tool_call_count = 0  # Reset after reminding
 
                     except Exception as e:
+                        error_str = str(e)
                         with self.log_lock:
-                            tqdm.write(f"[Thread {thread_id}] ❌ Error: {str(e)[:100]}")
+                            tqdm.write(f"[Thread {thread_id}] ❌ Error: {error_str[:300]}")
+                        
+                        # If API returns 400 bad_request, likely message format issue
+                        # Aggressively prune history to recover
+                        if "400" in error_str or "bad_request" in error_str:
+                            messages = self._safe_prune_messages(messages, keep_last=4)
+                            with self.log_lock:
+                                tqdm.write(f"[Thread {thread_id}] ✂️  Pruned to {len(messages)} messages after API error")
+                        
                         # Add error message to continue conversation
-                        error_msg = f"Error occurred: {e}. Please continue with the task."
+                        error_msg = f"Error occurred. Please continue with the task."
                         if self.custom_prompt:
                             error_msg += f"\n\nREMINDER: {self.custom_prompt}"
                         messages.append({

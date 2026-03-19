@@ -1,6 +1,9 @@
 """MCP server for paragraph and line/column navigation."""
 
+import base64
+import io
 import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from mcp.server import Server
@@ -96,7 +99,8 @@ class MCPServer:
         self, 
         paragraphs: Optional[List[str]] = None,
         page_manager: Optional["PageManager"] = None,
-        db_path: Optional[str] = None
+        db_path: Optional[str] = None,
+        extracted_dir: Optional[Path] = None
     ) -> None:
         """Initialize MCP server.
 
@@ -104,10 +108,12 @@ class MCPServer:
             paragraphs: List of text paragraphs (optional, for backward compatibility)
             page_manager: PageManager instance for advanced navigation (optional)
             db_path: Path to SQLite database for dataset storage (optional)
+            extracted_dir: Path to extracted directory containing page_XXX/ subdirs (optional, for image access)
         """
         self.navigator = ParagraphNavigator(paragraphs) if paragraphs else None
         self.page_manager = page_manager
         self.db_path = db_path
+        self.extracted_dir = Path(extracted_dir) if extracted_dir else None
         self.dataset_manager = None
         self.should_exit = False
         self.page_submission_counts: Dict[int, int] = {}
@@ -542,6 +548,43 @@ class MCPServer:
                     ),
                 ])
 
+            # Add image tools if extracted_dir is available
+            if self.extracted_dir:
+                tools.extend([
+                    Tool(
+                        name="list_page_images",
+                        description="List available images for a specific page, including cropped figures and the full page image",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "page_number": {
+                                    "type": "integer",
+                                    "description": "Page number to list images for",
+                                }
+                            },
+                            "required": ["page_number"],
+                        },
+                    ),
+                    Tool(
+                        name="get_image",
+                        description="Get a specific image as base64 data URL. Use list_page_images first to see available images.",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "page_number": {
+                                    "type": "integer",
+                                    "description": "Page number",
+                                },
+                                "image_name": {
+                                    "type": "string",
+                                    "description": "Image filename (e.g., '1.jpg' for cropped image, 'page_001.png' for full page)",
+                                },
+                            },
+                            "required": ["page_number", "image_name"],
+                        },
+                    ),
+                ])
+
             return tools
 
         @self.server.call_tool()
@@ -934,8 +977,106 @@ class MCPServer:
                 info["submission_count"] = self.page_submission_counts.get(page_num, 0)
                 return [TextContent(type="text", text=str(info))]
 
+            # Image tools
+            elif name == "list_page_images" and self.extracted_dir:
+                page_num = arguments["page_number"]
+                page_dir = self._get_page_dir(page_num)
+                if page_dir is None:
+                    return [TextContent(type="text", text=f"Page {page_num} not found")]
+                
+                available_images = []
+                
+                # Check for full page image
+                for ext in (".png", ".jpg", ".jpeg"):
+                    page_img = page_dir / f"page_{page_num:03d}{ext}"
+                    if page_img.exists():
+                        available_images.append({
+                            "name": page_img.name,
+                            "type": "full_page",
+                        })
+                        break
+                
+                # Check for cropped images
+                images_dir = page_dir / "images"
+                if images_dir.is_dir():
+                    for img_file in sorted(images_dir.iterdir()):
+                        if img_file.suffix.lower() in (".jpg", ".jpeg", ".png"):
+                            available_images.append({
+                                "name": f"images/{img_file.name}",
+                                "type": "cropped",
+                            })
+                
+                response = {
+                    "page_number": page_num,
+                    "image_count": len(available_images),
+                    "images": available_images,
+                }
+                return [TextContent(type="text", text=json.dumps(response, ensure_ascii=False))]
+
+            elif name == "get_image" and self.extracted_dir:
+                page_num = arguments["page_number"]
+                image_name = arguments["image_name"]
+                page_dir = self._get_page_dir(page_num)
+                if page_dir is None:
+                    return [TextContent(type="text", text=f"Page {page_num} not found")]
+                
+                image_path = page_dir / image_name
+                if not image_path.exists():
+                    return [TextContent(type="text", text=f"Image '{image_name}' not found in page {page_num}")]
+                
+                # Security: ensure path stays within page_dir
+                try:
+                    image_path.resolve().relative_to(page_dir.resolve())
+                except ValueError:
+                    return [TextContent(type="text", text="Invalid image path")]
+                
+                data_url = self._encode_image_to_base64(image_path)
+                response = {
+                    "page_number": page_num,
+                    "image_name": image_name,
+                    "data_url": data_url,
+                }
+                return [TextContent(type="text", text=json.dumps(response, ensure_ascii=False))]
+
             else:
                 raise ValueError(f"Unknown tool: {name}")
+
+    def _encode_image_to_base64(self, image_path: Path) -> str:
+        """Encode image file to base64 data URL.
+        
+        Args:
+            image_path: Path to image file
+            
+        Returns:
+            Base64 data URL string
+        """
+        from PIL import Image
+
+        with Image.open(image_path) as img:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG")
+            img_bytes = buffer.getvalue()
+
+        base64_str = base64.b64encode(img_bytes).decode("utf-8")
+        return f"data:image/jpeg;base64,{base64_str}"
+
+    def _get_page_dir(self, page_number: int) -> Optional[Path]:
+        """Get page directory path for a given page number.
+        
+        Args:
+            page_number: Page number
+            
+        Returns:
+            Path to page directory, or None if not found
+        """
+        if not self.extracted_dir:
+            return None
+        page_dir = self.extracted_dir / f"page_{page_number:03d}"
+        if page_dir.is_dir():
+            return page_dir
+        return None
 
     async def run(self) -> None:
         """Run the MCP server."""
@@ -946,7 +1087,8 @@ class MCPServer:
 async def create_mcp_server(
     paragraphs: Optional[List[str]] = None,
     page_manager: Optional["PageManager"] = None,
-    db_path: Optional[str] = None
+    db_path: Optional[str] = None,
+    extracted_dir: Optional[Path] = None
 ) -> MCPServer:
     """Create and return an MCP server instance.
 
@@ -954,8 +1096,9 @@ async def create_mcp_server(
         paragraphs: List of text paragraphs (optional)
         page_manager: PageManager instance for advanced navigation (optional)
         db_path: Path to SQLite database for dataset storage (optional)
+        extracted_dir: Path to extracted directory for image access (optional)
 
     Returns:
         Configured MCP server
     """
-    return MCPServer(paragraphs=paragraphs, page_manager=page_manager, db_path=db_path)
+    return MCPServer(paragraphs=paragraphs, page_manager=page_manager, db_path=db_path, extracted_dir=extracted_dir)

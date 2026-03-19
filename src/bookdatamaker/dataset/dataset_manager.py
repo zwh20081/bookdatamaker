@@ -296,8 +296,7 @@ class DatasetManager:
         output_file.parent.mkdir(parents=True, exist_ok=True)
         
         # Export using native method
-        compression_value = None if compression.lower() == 'none' else compression.lower()
-        dataset.to_parquet(str(output_file), compression=compression_value)
+        dataset.to_parquet(str(output_file))
         
         return len(entries)
 

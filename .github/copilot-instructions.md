@@ -10,7 +10,7 @@ A Python CLI tool for extracting text from documents using DeepSeek OCR and gene
 2. **Stage 2 - Generate**: `bookdatamaker generate` → Parallel LLM threads with MCP navigation → SQLite → `bookdatamaker export-dataset` → Parquet/JSONL/CSV
 
 ### Core Components
-- **OCRExtractor** (`ocr/extractor.py`): Dual-mode (API/local) text extraction with DeepSeek-OCR. Requires `transformers==4.46.3` for local mode.
+- **OCRExtractor** (`ocr/extractor.py`): Dual-mode (API/local) text extraction with DeepSeek-OCR. Supports OCR-1 and OCR-2 via `ocr_version` parameter (default: "2"). Version-specific config in `_VERSION_CONFIG` class dict. Requires `transformers==4.46.3` for local mode.
 - **PageManager** (`utils/page_manager.py`): In-memory document storage with line/column/paragraph indexing. Loads from `page_XXX/` directories or `combined.txt` with `[PAGE_XXX]` markers.
 - **MCPServer** (`mcp/server.py`): Provides 15+ navigation tools (pages, lines, paragraphs, search, submit_dataset) for LLMs. Uses stdio transport.
 - **ParallelDatasetGenerator** (`llm/parallel_generator.py`): Spawns N threads at distributed positions. Each thread uses OpenAI client + MCP tools. Supports resume from checkpoint.
@@ -161,9 +161,10 @@ with StatusIndicator() as status:
 - **CUDA**: Required for GPU acceleration in local mode
 
 ## Common Pitfalls
-- **Forgetting `transformers==4.46.3`**: DeepSeek-OCR will fail with other versions
+- **Forgetting `transformers==4.46.3`**: DeepSeek-OCR (both v1 and v2) will fail with other versions
 - **Missing `--tool-call-parser`**: Required for vLLM mode, causes cryptic errors
 - **Distribution mismatch**: Number of distribution values determines thread count, not `--threads`
 - **OOM in vLLM**: Reduce `--max-model-len` if GPU memory errors occur
 - **Checkpoint conflicts**: Clear with `DatasetManager.clear_thread_states()` if resuming fails
 - **Invalid messages array**: Must be even length, start with user, end with assistant (validated in `add_entry()`)
+- **OCR version mismatch**: Ensure vLLM server model matches `--ocr-version` (OCR-2 model with `--ocr-version 2`)

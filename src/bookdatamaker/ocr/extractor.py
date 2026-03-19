@@ -13,6 +13,22 @@ from PIL import Image
 class OCRExtractor:
     """Extract text from images using DeepSeek OCR API or local transformers model."""
 
+    # Version-specific configuration
+    _VERSION_CONFIG = {
+        "1": {
+            "default_model": "deepseek-ai/DeepSeek-OCR",
+            "image_size": 640,
+            "api_ngram_size": 30,
+            "use_flash_attn": False,
+        },
+        "2": {
+            "default_model": "deepseek-ai/DeepSeek-OCR-2",
+            "image_size": 768,
+            "api_ngram_size": 20,
+            "use_flash_attn": True,
+        },
+    }
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -23,6 +39,7 @@ class OCRExtractor:
         device: str = "cuda",
         skip_model_load: bool = False,
         api_concurrency: int = 4,
+        ocr_version: Literal["1", "2"] = "2",
     ) -> None:
         """Initialize OCR extractor.
 
@@ -30,16 +47,26 @@ class OCRExtractor:
             api_key: DeepSeek API key (required for API mode)
             api_url: DeepSeek API base URL
             mode: "api" for API calls, "local" for self-hosted transformers model
-            local_model_path: Path to local model (for local mode)
+            local_model_path: Path to local model (for local mode). Overrides ocr_version default.
             batch_size: Batch size for local transformers processing
             device: Torch device for local mode (default: "cuda")
             skip_model_load: Skip loading OCR model (for plain text extraction)
             api_concurrency: Concurrent requests for API mode (default: 4)
+            ocr_version: DeepSeek OCR version: "1" for OCR-1, "2" for OCR-2 (default)
         """
         self.mode = mode
         self.api_key = api_key
         self.api_url = api_url.rstrip("/")
-        self.local_model_path = local_model_path or "deepseek-ai/DeepSeek-OCR"
+        self.ocr_version = ocr_version
+
+        # Load version-specific config
+        vcfg = self._VERSION_CONFIG[ocr_version]
+        self.default_model_name: str = vcfg["default_model"]
+        self.image_size: int = vcfg["image_size"]
+        self.api_ngram_size: int = vcfg["api_ngram_size"]
+        self.use_flash_attn: bool = vcfg["use_flash_attn"]
+
+        self.local_model_path = local_model_path or self.default_model_name
         self.batch_size = batch_size
         self.device = device
         self.skip_model_load = skip_model_load
@@ -112,17 +139,34 @@ class OCRExtractor:
 
         from transformers import AutoModel, AutoTokenizer
         
-        # Set CUDA device
-        
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.local_model_path, 
             trust_remote_code=True
         )
+
+        model_kwargs = {
+            "trust_remote_code": True,
+            "use_safetensors": True,
+            "torch_dtype": torch.bfloat16,
+        }
+        if self.use_flash_attn:
+            try:
+                import flash_attn  # noqa: F401
+                model_kwargs["_attn_implementation"] = "flash_attention_2"
+            except ImportError:
+                import warnings
+                warnings.warn(
+                    "flash-attn not installed. OCR-2 will run without flash_attention_2. "
+                    "For better performance, install it:\n"
+                    "  pip install flash-attn --no-build-isolation\n"
+                    "Or install bookdatamaker[local-flash]",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
         self.model = AutoModel.from_pretrained(
             self.local_model_path,
-            trust_remote_code=True,
-            use_safetensors=True,
-            torch_dtype=torch.bfloat16
+            **model_kwargs,
         ).to(self.device)
         self.model = self.model.eval()
         
@@ -131,6 +175,7 @@ class OCRExtractor:
         
         This removes bounding box annotations that may appear in API mode output
         and removes empty lines to make the output more compact.
+        Used for plain text mode where no image cropping is needed.
         
         Args:
             text: Raw OCR text
@@ -146,6 +191,80 @@ class OCRExtractor:
             if not re.search(r'\[\[.*?\]\]', line) and line.strip()
         ]
         return '\n'.join(filtered_lines)
+
+    def _post_process_ocr_output(
+        self, text: str, page_image: Image.Image, page_dir: Path
+    ) -> str:
+        """Post-process OCR output: crop images from ref/det annotations and clean text.
+        
+        Parses `<|ref|>label<|/ref|><|det|>[[x1,y1],[x2,y2]]<|/det|>` patterns.
+        For image refs, crops the region from the page image and saves to page_dir/images/.
+        Replaces image refs with markdown image links. Removes non-image refs.
+        
+        Args:
+            text: Raw OCR text with ref/det annotations
+            page_image: PIL Image of the full page (used for cropping)
+            page_dir: Directory for this page (e.g., extracted/page_001/)
+            
+        Returns:
+            Processed text with image links and clean formatting
+        """
+        import re
+
+        img_w, img_h = page_image.size
+        images_dir = page_dir / "images"
+        image_counter = 0
+
+        # Pattern: <|ref|>label<|/ref|><|det|>[[x1,y1],[x2,y2]]<|/det|>
+        ref_det_pattern = re.compile(
+            r'<\|ref\|>(.*?)<\|/ref\|><\|det\|>(.*?)<\|/det\|>'
+        )
+
+        def _replace_ref(match: re.Match) -> str:
+            nonlocal image_counter
+            label = match.group(1).strip()
+            coords_str = match.group(2).strip()
+
+            if label.lower() != "image":
+                # Non-image ref/det: remove entirely
+                return ""
+
+            # Parse coordinates: [[x1,y1],[x2,y2]]
+            coord_pattern = re.compile(r'\[\[(\d+),(\d+)\],\[(\d+),(\d+)\]\]')
+            coord_match = coord_pattern.search(coords_str)
+            if not coord_match:
+                return ""
+
+            # Coordinates are in 0-999 range, scale to actual image dimensions
+            x1 = int(coord_match.group(1)) * img_w / 999
+            y1 = int(coord_match.group(2)) * img_h / 999
+            x2 = int(coord_match.group(3)) * img_w / 999
+            y2 = int(coord_match.group(4)) * img_h / 999
+
+            # Ensure valid crop box
+            left = max(0, min(x1, x2))
+            upper = max(0, min(y1, y2))
+            right = min(img_w, max(x1, x2))
+            lower = min(img_h, max(y1, y2))
+
+            if right <= left or lower <= upper:
+                return ""
+
+            # Crop and save
+            image_counter += 1
+            images_dir.mkdir(parents=True, exist_ok=True)
+            cropped = page_image.crop((left, upper, right, lower))
+            img_filename = f"{image_counter}.jpg"
+            cropped.save(images_dir / img_filename, "JPEG", quality=95)
+
+            return f"![](images/{img_filename})"
+
+        processed = ref_det_pattern.sub(_replace_ref, text)
+
+        # Remove empty lines and clean up
+        lines = processed.split('\n')
+        cleaned_lines = [line for line in lines if line.strip()]
+        return '\n'.join(cleaned_lines)
     
     def _encode_image(self, image_path: Path) -> str:
         """Encode image to base64 data URL.
@@ -222,13 +341,13 @@ class OCRExtractor:
         response = await self.client.post(
             f"{self.api_url}/chat/completions",
             json={
-                "model": "deepseek-ai/DeepSeek-OCR",
+                "model": self.default_model_name,
                 "messages": messages,
                 "temperature": 0.0,
                 "extra_body": {
                     "skip_special_tokens": False,
                     "vllm_xargs": {
-                        "ngram_size": 30,
+                        "ngram_size": self.api_ngram_size,
                         "window_size": 90,
                         "whitelist_token_ids": [128821, 128822],
                     },
@@ -466,17 +585,18 @@ class OCRExtractor:
             try:
                 # Call model.infer() - DeepSeek-OCR's API
                 # Model will save result to page_dir/result.mmd
-                self.model.infer(
-                    self.tokenizer,
-                    prompt=prompt,
-                    image_file=str(img_path),
-                    output_path=str(page_dir),
-                    base_size=1024,
-                    image_size=640,
-                    crop_mode=True,
-                    test_compress=False,
-                    save_results=True
-                )
+                infer_kwargs = {
+                    "prompt": prompt,
+                    "image_file": str(img_path),
+                    "output_path": str(page_dir),
+                    "base_size": 1024,
+                    "image_size": self.image_size,
+                    "crop_mode": True,
+                    "save_results": True,
+                }
+                if self.ocr_version == "1":
+                    infer_kwargs["test_compress"] = False
+                self.model.infer(self.tokenizer, **infer_kwargs)
             finally:
                 # Restore stdout/stderr
                 sys.stdout = old_stdout
@@ -594,14 +714,15 @@ class OCRExtractor:
                             page_dir = output_dir / f"page_{page_num:03d}"
                             page_dir.mkdir(parents=True, exist_ok=True)
                             
-                            # Save text to result.mmd (filter in API mode)
-                            result_file = page_dir / "result.mmd"
-                            filtered_text = self._filter_ocr_text(text)
-                            result_file.write_text(filtered_text, encoding="utf-8")
-                            
-                            # Save page image
+                            # Save page image first (needed for cropping)
                             image_file = page_dir / f"page_{page_num:03d}.png"
                             image.save(image_file)
+                            
+                            # Post-process: crop images from ref/det and clean text
+                            result_file = page_dir / "result.mmd"
+                            rgb_image = image.convert("RGB") if image.mode != "RGB" else image
+                            processed_text = self._post_process_ocr_output(text, rgb_image, page_dir)
+                            result_file.write_text(processed_text, encoding="utf-8")
                         
                         image_results.append((page_num, text))
                     finally:
