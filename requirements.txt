@@ -12,6 +12,7 @@ tqdm
 PyMuPDF
 ebooklib
 beautifulsoup4
+python-pptx
 rapidfuzz
 
 # Optional: for self-hosted models

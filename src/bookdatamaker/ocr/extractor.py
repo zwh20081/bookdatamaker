@@ -877,6 +877,7 @@ class OCRExtractor:
         page_num: int,
         text: str,
         image: Optional[Image.Image] = None,
+        embedded_images: Optional[List[Image.Image]] = None,
     ) -> str:
         """Save a non-OCR page result using the same directory layout as OCR output."""
         page_dir = output_dir / f"page_{page_num:03d}"
@@ -889,6 +890,14 @@ class OCRExtractor:
         if image is not None:
             image_file = page_dir / f"page_{page_num:03d}.png"
             image.save(image_file)
+
+        if embedded_images:
+            images_dir = page_dir / "images"
+            images_dir.mkdir(parents=True, exist_ok=True)
+            for idx, emb_img in enumerate(embedded_images):
+                if emb_img.mode == "RGBA":
+                    emb_img = emb_img.convert("RGB")
+                emb_img.save(images_dir / f"{idx}.jpg", "JPEG", quality=95)
 
         return filtered_text
 
@@ -1213,6 +1222,32 @@ class OCRExtractor:
         try:
             for page_num, content in iter_document_pages(document_path, prefer_text=prefer_text, start_page=1):
                 if page_num in completed_set:
+                    continue
+
+                if isinstance(content, tuple) and len(content) == 3:
+                    text, image, embedded_images = content
+                    saved_text = text
+                    if output_dir:
+                        saved_text = self._save_plain_text_page(
+                            output_dir, page_num, text, image=image,
+                            embedded_images=embedded_images,
+                        )
+                    completed_set.add(page_num)
+                    completed_pages.append(page_num)
+                    if output_dir:
+                        self._save_progress(
+                            output_dir=output_dir,
+                            document_path=document_path,
+                            prefer_text=prefer_text,
+                            total_pages=total_pages,
+                            completed_pages=completed_pages,
+                            failed_pages=failed_pages,
+                            status="running",
+                        )
+                    else:
+                        in_memory_results.append((page_num, saved_text))
+                    if pbar is not None:
+                        pbar.update(1)
                     continue
 
                 if isinstance(content, tuple) and len(content) == 2:

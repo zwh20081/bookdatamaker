@@ -14,8 +14,10 @@ from tqdm import tqdm
 from rich.console import Console
 from rich.panel import Panel
 
-from bookdatamaker.dataset.dataset_manager import DatasetManager, DuplicateEntryError
+from bookdatamaker.dataset.dataset_manager import DatasetManager, DuplicateEntryError, DEFAULT_DUPLICATE_THRESHOLD
 from bookdatamaker.utils.page_manager import PageManager
+
+WARNING_SIMILARITY_THRESHOLD = 50.0
 
 console = Console()
 
@@ -86,6 +88,7 @@ class ParallelDatasetGenerator:
         api_delay: float = 0.0,
         extracted_dir: Optional[Path] = None,
         minimax_mcp_key: Optional[str] = None,
+        search1api_key: Optional[str] = None,
     ) -> None:
         """Initialize parallel dataset generator.
 
@@ -127,6 +130,8 @@ class ParallelDatasetGenerator:
         self.extracted_dir = Path(extracted_dir) if extracted_dir else None
         self.minimax_mcp_key = minimax_mcp_key
         self.minimax_mcp = None  # Initialized lazily in generate()
+        self.search1api_key = search1api_key
+        self.search1api_mcp = None  # Initialized lazily in generate()
         self.vllm_llm = None  # Will be initialized if using vLLM mode
         
         # Progress tracking
@@ -291,6 +296,8 @@ class ParallelDatasetGenerator:
                     if answer:
                         short_a = answer[:60] + "..." if len(answer) > 60 else answer
                         tqdm.write(f"[Thread {thread_id}]    Rejected A: {short_a}")
+                elif "warning" in result:
+                    tqdm.write(f"[Thread {thread_id}] ⚠️ {result['warning']}")
                 else:
                     count = result.get('count', '?')
                     remaining = result.get('remaining', 0)
@@ -350,121 +357,155 @@ class ParallelDatasetGenerator:
             System prompt text
         """
         total_pages = self.page_manager.get_total_pages()
-        base_prompt = f"""You are a helpful assistant with access to the following tools to help generate multi-turn conversations from a document.
+        base_prompt = f"""You are a dataset generation assistant. Your job is to read a document via tools and produce high-quality multi-turn conversations.
 
 # Task
-- Starting position: Page {start_page}
-- Total pages: {total_pages}
-- Target: Generate exactly {self.datasets_per_thread} multi-turn conversations
-- Thread ID: {thread_id}
+Starting page: {start_page} | Total pages: {total_pages} | Target: {self.datasets_per_thread} conversations | Thread: {thread_id}
 
-# Available Tools
-You have access to the following tools:
-- get_current_page: Get the current page content with metadata
-- next_page: Move to the next page(s) and get content
-- previous_page: Move to the previous page(s) and get content
-- jump_to_page: Jump to a specific page by page number
-- get_page_context: Get current page with surrounding pages for context
-- submit_dataset: Submit a multi-turn conversation to the dataset (see format below)
-- exit: Exit the session after completing all submissions
-- get_page_access_summary: View global coverage stats and find pages with the fewest visits"""
+# Tools
+Navigation: get_current_page, next_page(steps), previous_page(steps), jump_to_page(page_number), get_page_context(before, after)
+Document search: search_text(query) — search WITHIN this document only (find keywords across pages)
+Coverage: get_page_access_summary(limit)
+Submission: submit_dataset(messages), exit(reason)"""
 
-        # Add image tool descriptions if available
         if self.extracted_dir:
-            base_prompt += """
-- list_page_images: List available images for a specific page, returns absolute file paths"""
+            base_prompt += "\nImages: list_page_images(page_number)"
             if not self.minimax_mcp:
-                base_prompt += """
-- get_image: Get a specific image as base64 data URL (use list_page_images first to see available images)"""
+                base_prompt += ", get_image(page_number, image_name)"
 
-        # Add MiniMax MCP tool descriptions if available
+        if self.minimax_mcp:
+            base_prompt += "\nInternet search: minimax_web_search — search the REAL INTERNET for external information (NOT the document)"
+            base_prompt += "\nImage analysis: minimax_understand_image(image_url) — analyze an image file"
+
+        if self.search1api_mcp:
+            base_prompt += "\nInternet search: search1api_search(query) — search the REAL INTERNET via Search1API"
+            base_prompt += "\nNews search: search1api_news(query) — search for latest news articles"
+            base_prompt += "\nWeb crawl: search1api_crawl(url) — extract content from a URL"
+
         if self.minimax_mcp:
             base_prompt += """
-- minimax_web_search: Search the web for additional information about a topic
-- minimax_understand_image: Analyze and understand an image (pass the file path from list_page_images as image_url)"""
 
-        # Add image understanding workflow hint
+# IMPORTANT: search_text vs minimax_web_search
+- search_text: Searches ONLY within this document. Use it to find where a keyword appears in the document pages.
+- minimax_web_search: Searches the REAL INTERNET. Use it to find external examples, latest news, real-world cases, industry data.
+They are completely different tools. Do NOT confuse them.
+
+# Web Search Enhancement (STRONGLY ENCOURAGED)
+You have minimax_web_search for INTERNET search — USE IT ACTIVELY:
+- After reading document content, call minimax_web_search to find real-world examples, latest developments, or case studies
+- Combine document knowledge with web-sourced examples to create richer, more practical conversations
+- For general principles, web-search for concrete application scenarios or success/failure cases
+- For industry-specific content, web-search for recent trends, data, or news to supplement the document
+- Aim to use minimax_web_search at least once every 2-3 submissions
+- The best conversations blend document theory with real-world evidence found via internet search"""
+
+        if self.search1api_mcp and not self.minimax_mcp:
+            base_prompt += """
+
+# IMPORTANT: search_text vs search1api_search
+- search_text: Searches ONLY within this document. Use it to find where a keyword appears in the document pages.
+- search1api_search: Searches the REAL INTERNET via Search1API. Use it to find external examples, latest news, real-world cases, industry data.
+- search1api_news: Searches for NEWS ARTICLES on the internet. Use for recent events, trends and developments.
+They are completely different tools from search_text. Do NOT confuse them.
+
+# Web Search Enhancement (STRONGLY ENCOURAGED)
+You have search1api_search and search1api_news for INTERNET search — USE THEM ACTIVELY:
+- After reading document content, call search1api_search to find real-world examples, latest developments, or case studies
+- Combine document knowledge with web-sourced examples to create richer, more practical conversations
+- For general principles, web-search for concrete application scenarios or success/failure cases
+- For industry-specific content, use search1api_news for recent trends, data, or news to supplement the document
+- Aim to use search1api_search or search1api_news at least once every 2-3 submissions
+- The best conversations blend document theory with real-world evidence found via internet search"""
+
+        if self.search1api_mcp and self.minimax_mcp:
+            base_prompt += """
+
+# IMPORTANT: search_text vs search1api_search
+- search_text: Searches ONLY within this document.
+- search1api_search / search1api_news: Searches the REAL INTERNET via Search1API (alternative to minimax_web_search).
+You can use either minimax_web_search or search1api_search for internet lookups."""
+
         if self.extracted_dir and self.minimax_mcp:
             base_prompt += """
 
-# Image Understanding Workflow
-When you encounter image references (e.g., ![](images/0.jpg)) in page content:
-1. Call list_page_images to get available images with their absolute file paths
-2. Call minimax_understand_image with the file path as image_url to analyze the image
-3. Use the image analysis result to enrich your conversation dataset"""
+# Image Workflow
+When you see image references like ![](images/0.jpg) in page content:
+1. Call list_page_images → get absolute file paths
+2. Call minimax_understand_image with the file path as image_url
+3. Incorporate the image analysis into your conversation"""
 
         base_prompt += f"""
 
-# Multi-Turn Conversation Format
-When calling submit_dataset, provide a "messages" array with alternating user/assistant messages:
-- Must start with a user message and end with an assistant message
-- Can be single-turn (2 messages) or multi-turn (4, 6, 8+ messages)
-- Example single-turn: ["What is X?", "X is..."]
-- Example multi-turn: ["What is X?", "X is...", "Can you explain more?", "Sure, X also..."]
+# submit_dataset Format
+Provide a "messages" array of alternating user/assistant strings:
+- Start with user, end with assistant
+- Single-turn: ["What is X?", "X is..."]
+- Multi-turn: ["What is X?", "X is...", "Can you elaborate?", "Sure, X also..."]
 
-# Navigation Guidelines
-- Start at page {start_page} (your assigned starting position)
-- PREFER using next_page and previous_page to explore pages sequentially from your starting position
-- Use jump_to_page ONLY when necessary (e.g., to return to starting position or access a specific far-away page)
-- Focus on exploring the content near your starting position to ensure good coverage across threads
+Target mix: ~30% single-turn (2 msgs), ~50% two-turn (4 msgs), ~20% three-turn+ (6+ msgs)
 
 # Workflow
-1. Use jump_to_page({start_page}) to start reading from page {start_page}
-2. Use next_page and previous_page to explore nearby pages sequentially
-3. When you find good content, generate a conversation
-4. Use submit_dataset with messages array (alternating user/assistant) to save it
-5. Repeat until you have submitted {self.datasets_per_thread} conversations
-6. Call exit when you reach {self.datasets_per_thread} submissions
+1. jump_to_page({start_page}) to start
+2. Explore nearby pages with next_page / previous_page
+3. Generate a conversation from the content
+4. submit_dataset to save it
+5. Repeat until {self.datasets_per_thread} submissions, then call exit
 
-# Quality Guidelines - CRITICAL
-- Questions should be clear and answerable from the document
-- Answers must be accurate and based on document content
-- Multi-turn conversations should flow naturally and build on previous exchanges
-- Cover diverse topics and difficulty levels
-- Explore content near your assigned starting position (page {start_page})
+# Language
+Generate all conversations in the same language as the document content.
 
-## SELF-CONTAINED CONTENT REQUIREMENT - EXTREMELY IMPORTANT
-**All conversation content MUST be completely self-contained and standalone:**
-- ❌ NEVER use phrases like: "根据文本", "文中提到", "文章指出", "上文说明", "原文描述", "according to the text", "the document states", etc.
-- ❌ NEVER reference "the document", "the text", "the material", "the passage", "the article", "the book", etc.
-- ✅ Present all information as direct knowledge without any meta-references
-- ✅ User questions should be natural inquiries about the topic itself
-- ✅ Assistant answers should explain concepts/facts directly as if from general knowledge
-- ✅ Include all necessary context within the answer itself - don't assume access to source material
+# Quality Rules
 
-**Examples:**
-- ❌ BAD: "根据文本，光合作用是植物..." → This references the source
-- ✅ GOOD: "光合作用是植物通过叶绿素..." → Direct explanation
-- ❌ BAD: "文中提到的三个步骤是..." → References document
-- ✅ GOOD: "这个过程包含三个步骤..." → Direct presentation
-- ❌ BAD: "What does the text say about X?" → Meta-question
-- ✅ GOOD: "What is X?" or "How does X work?" → Direct question
+## Self-Contained Content (CRITICAL)
+All content MUST be standalone — no meta-references to any source.
+- ❌ NEVER: "根据文本", "文中提到", "文章指出", "上文说明", "原文描述", "according to the text", "the document states"
+- ❌ NEVER reference "the document/text/material/passage/article/book"
+- ✅ Present information as direct knowledge
+- ✅ Questions = natural topic inquiries; Answers = direct explanations
 
-## Content Adaptation Rules
-When generating Q&A pairs, adapt your approach based on content type:
+Examples:
+- ❌ "根据文本，光合作用是植物..." → ✅ "光合作用是植物通过叶绿素..."
+- ❌ "What does the text say about X?" → ✅ "How does X work?"
 
-### For Specific Events/Cases (事件、案例、实例):
-- **Include MAXIMUM context**: Provide full background, timeline, participants, location, and outcome
-- **Be comprehensive**: Don't truncate - include all relevant details from the document
-- **Preserve specificity**: Keep names, dates, numbers, and specific circumstances
-- Example: If describing a historical event, include when, where, who, what happened, why, and consequences
+## Answer Quality
+- Answers should be 50-300 words with substantive explanations
+- Be accurate and faithful to the source material
+- Include all necessary context within each answer
+- **Maximize context depth**: Each answer should be as comprehensive as possible. Before generating a conversation, read multiple consecutive pages (call next_page 2-3 times) to gather enough context. A well-informed answer that synthesizes information across pages is far more valuable than a shallow one from a single page.
 
-### For General Principles/Rules (通用规律、原理、概念):
-- **Generate MULTIPLE variations**: Create 2-4 different Q&A pairs exploring the same principle
-- **Different angles**: Ask about definition, application, examples, edge cases, comparison
-- **Vary difficulty**: Include basic explanation + advanced application scenarios
-- Example: For a scientific principle, create pairs for: definition, real-world application, related concepts, practical implications
+## Proactive Exploration
+- Do NOT generate a conversation from just one page when the topic spans multiple pages
+- Before writing a conversation, call next_page or get_page_context to check if the topic continues
+- Combine information from 2-4 pages into one rich, deep conversation
+- If a page ends mid-topic, ALWAYS read the next page before submitting
 
-# Coverage Guidelines
-- Use get_page_access_summary regularly to monitor which pages are under-explored
-- Prioritize reading and extracting from pages with the lowest access counts whenever feasible
-- Avoid repeatedly revisiting heavily accessed pages unless extra context is required
+## Reasoning & Inference (IMPORTANT)
+- Do NOT merely copy or paraphrase the document content
+- Use the document as a foundation, then REASON about it to produce deeper insights:
+  - Draw connections between concepts from different parts of the document
+  - Generate "why" and "how" questions that require analytical thinking
+  - Create conversations that explore implications, comparisons, or applications not directly stated
+  - Synthesize information from multiple pages into a unified explanation
+- Example: If the document describes technique A on page 5 and technique B on page 12, you could create a conversation comparing the two, discussing when each is more appropriate — this is new knowledge derived from reasoning
 
-# Content Restrictions
-- Do not create question-answer pairs based on publication metadata such as the book title, author, publisher, ISBN, edition details, or copyright pages
-- 如果页面主要是书本的出版信息、标题、作者等内容，请不要提交问答，直接调用 next_page 跳过
+## Content Adaptation
+For specific events/cases (事件、案例): Include FULL context — background, timeline, participants, outcome. Preserve names, dates, numbers.
+For general principles (原理、概念): Submit SEPARATE conversations exploring different angles — definition, application, examples, edge cases.
 
-Remember: You MUST use the tools to accomplish this task. Start by calling jump_to_page({start_page}) to reach your starting position, then explore using next_page/previous_page."""
+## Coverage
+- After every 3 submissions, call get_page_access_summary to check coverage
+- If your current area has high submission counts, jump to under-explored pages
+- Use search_text to find specific topics across the document when relevant
+
+## Error Recovery
+- If submit_dataset returns a duplicate error, skip that topic and move to different pages
+- If a page has little useful content, call next_page immediately
+
+## Skip These Pages
+Do NOT generate conversations from: table of contents, indexes, references/bibliography, blank pages, publication metadata (title, author, publisher, ISBN, edition, copyright).
+直接调用 next_page 跳过这些页面。
+
+Start now: call jump_to_page({start_page})."""
         
         # Append custom prompt if provided
         if self.custom_prompt:
@@ -602,6 +643,49 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
             }
         ]
 
+        # search_text tool
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "search_text",
+                "description": "Search for text across the entire document. Returns matching lines with page numbers.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Text to search for"
+                        },
+                        "case_sensitive": {
+                            "type": "boolean",
+                            "description": "Case-sensitive search",
+                            "default": False
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        })
+
+        # get_page_access_summary tool
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "get_page_access_summary",
+                "description": "Get page submission statistics: which pages have been covered and which are under-explored. Use to find pages that need more attention.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "Number of least-submitted pages to highlight",
+                            "default": 5
+                        }
+                    }
+                }
+            }
+        })
+
         # Add image tools if extracted_dir is available
         if self.extracted_dir:
             tools.append({
@@ -649,6 +733,10 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
         if self.minimax_mcp:
             tools.extend(self.minimax_mcp.get_openai_tool_defs())
 
+        # Add Search1API MCP tools if proxy is available
+        if self.search1api_mcp:
+            tools.extend(self.search1api_mcp.get_openai_tool_defs())
+
         return tools
 
     async def generate(self) -> int:
@@ -694,6 +782,22 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
             except Exception as e:
                 print(f"⚠️  Failed to initialize MiniMax MCP: {type(e).__name__}: {e}")
                 self.minimax_mcp = None
+        
+        # Initialize Search1API MCP proxy if key provided
+        if self.search1api_key:
+            import concurrent.futures
+            def _init_search1api():
+                from bookdatamaker.llm.search1api_mcp import Search1APIMCPProxy
+                proxy = Search1APIMCPProxy(api_key=self.search1api_key)
+                proxy.get_openai_tool_defs()
+                return proxy
+            try:
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                future = executor.submit(_init_search1api)
+                self.search1api_mcp = future.result(timeout=30)
+            except Exception as e:
+                print(f"⚠️  Failed to initialize Search1API MCP: {type(e).__name__}: {e}")
+                self.search1api_mcp = None
         
         # Initialize vLLM if needed (shared across threads)
         if self.mode == "vllm":
@@ -783,6 +887,10 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
         if self.minimax_mcp:
             self.minimax_mcp.close()
         
+        # Clean up Search1API MCP proxy
+        if self.search1api_mcp:
+            self.search1api_mcp.close()
+        
         # Aggregate results
         total_generated = sum(r["submitted"] for r in results)
         
@@ -857,6 +965,10 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                     submitted_count = saved_state["submitted_count"]
                     messages = saved_state["messages"]
                     
+                    # Replace system prompt with latest version
+                    if messages and messages[0].get("role") == "system":
+                        messages[0]["content"] = system_prompt
+                    
                     # Prune message history: use max_messages or default cap of 40
                     prune_limit = self.max_messages or 40
                     if len(messages) > prune_limit:
@@ -907,6 +1019,8 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                 max_iterations = self.datasets_per_thread * 20  # Safety limit
                 tools = self._get_mcp_tools()
                 no_tool_call_count = 0  # Track consecutive responses without tool calls
+                last_warned_hash: Optional[str] = None  # Track warned submission for re-submit acceptance
+                consecutive_similarity_count = 0  # Track consecutive similarity warnings/rejections
                 
                 for iteration in range(max_iterations):
                     try:
@@ -983,86 +1097,151 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                         tool_result = "Error: messages must have even length (alternating user-assistant pairs)"
                                         self._log_tool_result(thread_id, function_name, {"error": "Odd number of messages"})
                                     else:
-                                        try:
-                                            entry_id = dataset_manager.add_entry(messages_array)
-                                        except ValueError as ve:
-                                            tool_result = f"Error: {str(ve)}"
-                                            self._log_tool_result(thread_id, function_name, {"error": str(ve)})
-                                        except DuplicateEntryError as duplicate_error:
-                                            similarity_pct = duplicate_error.similarity
-                                            existing_id = duplicate_error.existing_entry["id"]
+                                        import hashlib
+                                        content_hash = hashlib.sha256(
+                                            json.dumps(messages_array, ensure_ascii=False).encode()
+                                        ).hexdigest()
+
+                                        # Check for similarity warning (50%-85%) before add_entry
+                                        formatted_for_check = [
+                                            {"role": "user" if i % 2 == 0 else "assistant", "content": c.strip()}
+                                            for i, c in enumerate(messages_array)
+                                        ]
+                                        similar = dataset_manager.find_similar_entry(
+                                            formatted_for_check, WARNING_SIMILARITY_THRESHOLD
+                                        )
+
+                                        if (
+                                            similar
+                                            and similar["similarity"] < DEFAULT_DUPLICATE_THRESHOLD
+                                            and content_hash != last_warned_hash
+                                        ):
+                                            # Warn but don't reject — show existing and ask to confirm
+                                            last_warned_hash = content_hash
+                                            sim_pct = similar["similarity"]
+                                            existing_msgs = similar["messages"]
+                                            existing_preview = "\n".join(
+                                                f"  {m['role']}: {m['content'][:120]}" for m in existing_msgs[:4]
+                                            )
+                                            consecutive_similarity_count += 1
+                                            web_search_hint = ""
+                                            if (self.minimax_mcp or self.search1api_mcp) and consecutive_similarity_count >= 2:
+                                                search_tool = "minimax_web_search" if self.minimax_mcp else "search1api_search"
+                                                web_search_hint = (
+                                                    "\n\n🔍 You have hit similar content multiple times in a row. "
+                                                    f"STRONGLY RECOMMENDED: Call {search_tool} NOW to find fresh external examples, "
+                                                    "real-world cases, or latest news related to the current topic, then build a NEW conversation "
+                                                    "that combines document content with web-sourced information."
+                                                )
                                             tool_result = (
-                                                "Duplicate submission rejected. The proposed conversation "
-                                                f"matches existing entry #{existing_id} with {similarity_pct:.1f}% similarity. "
-                                                "Please explore different content (consider using next_page) before submitting."
+                                                f"⚠️ Similar content detected ({sim_pct:.1f}% match with entry #{similar['id']}).\n"
+                                                f"Existing conversation preview:\n{existing_preview}\n\n"
+                                                "If you believe this is sufficiently different, call submit_dataset again with the same content to confirm.\n"
+                                                "Otherwise, modify the conversation to be more distinct, or move to different pages for fresh content."
+                                                + web_search_hint
                                             )
                                             self._log_tool_result(thread_id, function_name, {
-                                                "error": f"Duplicate entry #{existing_id} ({similarity_pct:.1f}%)",
-                                                "existing_id": existing_id,
-                                                "similarity": similarity_pct,
+                                                "warning": f"Similar to #{similar['id']} ({sim_pct:.1f}%)",
+                                                "action": "warned, awaiting re-submit",
+                                                "consecutive_similarity": consecutive_similarity_count,
                                             })
                                         else:
-                                            submitted_count += 1
-                                            self._update_progress(1)
-
-                                            page_number = current_position or (
-                                                page_manager.get_current_page_number() if page_manager else None
-                                            )
-                                            submission_counts = {}
-                                            if page_number is not None:
-                                                submission_counts = dataset_manager.record_page_submission(page_number)
-
-                                            # Save checkpoint after each successful submission
-                                            dataset_manager.save_thread_state(
-                                                thread_id=thread_id,
-                                                start_position=start_page,
-                                                current_position=current_position,
-                                                submitted_count=submitted_count,
-                                                target_count=self.datasets_per_thread,
-                                                status="running",
-                                                messages=_serialize_messages(messages)
-                                            )
-                                            
-                                            remaining = self.datasets_per_thread - submitted_count
-                                            turns = len(messages_array) // 2
-                                            if remaining > 0:
-                                                tool_result = f"Success! Submitted {turns}-turn conversation {submitted_count}/{self.datasets_per_thread}. You need {remaining} more conversations. Continue exploring and generating."
-                                                if self.custom_prompt:
-                                                    tool_result += f"\n\nREMINDER: {self.custom_prompt}"
+                                            # Either no warning needed or re-submitting after warning
+                                            if content_hash == last_warned_hash:
+                                                last_warned_hash = None  # Reset after acceptance
+                                            try:
+                                                entry_id = dataset_manager.add_entry(messages_array)
+                                            except ValueError as ve:
+                                                tool_result = f"Error: {str(ve)}"
+                                                self._log_tool_result(thread_id, function_name, {"error": str(ve)})
+                                            except DuplicateEntryError as duplicate_error:
+                                                similarity_pct = duplicate_error.similarity
+                                                existing_id = duplicate_error.existing_entry["id"]
+                                                consecutive_similarity_count += 1
+                                                web_search_hint = ""
+                                                if (self.minimax_mcp or self.search1api_mcp) and consecutive_similarity_count >= 2:
+                                                    search_tool = "minimax_web_search" if self.minimax_mcp else "search1api_search"
+                                                    web_search_hint = (
+                                                        " 🔍 Multiple consecutive duplicates detected — STOP submitting similar content! "
+                                                        f"Call {search_tool} RIGHT NOW to find fresh external examples, real-world cases, "
+                                                        "or latest news on this topic. Combine web results with document content to create "
+                                                        "genuinely new conversations."
+                                                    )
+                                                tool_result = (
+                                                    "Duplicate submission rejected. The proposed conversation "
+                                                    f"matches existing entry #{existing_id} with {similarity_pct:.1f}% similarity. "
+                                                    "Please explore different content (consider using next_page) before submitting."
+                                                    + web_search_hint
+                                                )
+                                                self._log_tool_result(thread_id, function_name, {
+                                                    "error": f"Duplicate entry #{existing_id} ({similarity_pct:.1f}%)",
+                                                    "existing_id": existing_id,
+                                                    "similarity": similarity_pct,
+                                                    "consecutive_similarity": consecutive_similarity_count,
+                                                })
                                             else:
-                                                tool_result = f"Success! Submitted {turns}-turn conversation {submitted_count}/{self.datasets_per_thread}. Target reached! Now call exit() to complete the task."
+                                                submitted_count += 1
+                                                consecutive_similarity_count = 0  # Reset on successful submission
+                                                self._update_progress(1)
 
-                                            # Evaluate page submission rankings to nudge exploration
-                                            if submission_counts and len(submission_counts) > 1 and page_number is not None:
-                                                total_submissions = sum(submission_counts.values())
-                                                # Avoid early warnings until enough submissions exist for ranking
-                                                if total_submissions >= 5:
-                                                    sorted_pages = sorted(
-                                                        submission_counts.items(),
-                                                        key=lambda item: (-item[1], item[0])
-                                                    )
-                                                    page_rank = next(
-                                                        (idx for idx, (page, _) in enumerate(sorted_pages) if page == page_number),
-                                                        None
-                                                    )
-                                                    if page_rank is not None:
-                                                        top_threshold = max(1, min(5, max(1, int(len(sorted_pages) * 0.2))))
-                                                        page_count = submission_counts.get(page_number, 0)
-                                                        if page_rank < top_threshold and page_count > 0:
-                                                            summary = dataset_manager.get_page_submission_summary(limit=5)
-                                                            least_pages = summary.get("least_submitted_pages", [])
-                                                            tool_result += (
-                                                                f"\n\n⚠️ Page {page_number} now has {page_count} submissions (rank {page_rank + 1}/{len(sorted_pages)})."
-                                                                f" Please spend more time on pages with fewer submissions, such as: {least_pages}."
-                                                                f"\nGlobal submission stats: {json.dumps(summary, ensure_ascii=False)}"
-                                                            )
+                                                page_number = current_position or (
+                                                    page_manager.get_current_page_number() if page_manager else None
+                                                )
+                                                submission_counts = {}
+                                                if page_number is not None:
+                                                    submission_counts = dataset_manager.record_page_submission(page_number)
 
-                                            self._log_tool_result(thread_id, function_name, {
-                                                "count": submitted_count, 
-                                                "remaining": remaining,
-                                                "turns": turns,
-                                                "messages": messages_array
-                                            })
+                                                # Save checkpoint after each successful submission
+                                                dataset_manager.save_thread_state(
+                                                    thread_id=thread_id,
+                                                    start_position=start_page,
+                                                    current_position=current_position,
+                                                    submitted_count=submitted_count,
+                                                    target_count=self.datasets_per_thread,
+                                                    status="running",
+                                                    messages=_serialize_messages(messages)
+                                                )
+                                                
+                                                remaining = self.datasets_per_thread - submitted_count
+                                                turns = len(messages_array) // 2
+                                                if remaining > 0:
+                                                    tool_result = f"Success! Submitted {turns}-turn conversation {submitted_count}/{self.datasets_per_thread}. You need {remaining} more conversations. Continue exploring and generating."
+                                                    if self.custom_prompt:
+                                                        tool_result += f"\n\nREMINDER: {self.custom_prompt}"
+                                                else:
+                                                    tool_result = f"Success! Submitted {turns}-turn conversation {submitted_count}/{self.datasets_per_thread}. Target reached! Now call exit() to complete the task."
+
+                                                # Evaluate page submission rankings to nudge exploration
+                                                if submission_counts and len(submission_counts) > 1 and page_number is not None:
+                                                    total_submissions = sum(submission_counts.values())
+                                                    # Avoid early warnings until enough submissions exist for ranking
+                                                    if total_submissions >= 5:
+                                                        sorted_pages = sorted(
+                                                            submission_counts.items(),
+                                                            key=lambda item: (-item[1], item[0])
+                                                        )
+                                                        page_rank = next(
+                                                            (idx for idx, (page, _) in enumerate(sorted_pages) if page == page_number),
+                                                            None
+                                                        )
+                                                        if page_rank is not None:
+                                                            top_threshold = max(1, min(5, max(1, int(len(sorted_pages) * 0.2))))
+                                                            page_count = submission_counts.get(page_number, 0)
+                                                            if page_rank < top_threshold and page_count > 0:
+                                                                summary = dataset_manager.get_page_submission_summary(limit=5)
+                                                                least_pages = summary.get("least_submitted_pages", [])
+                                                                tool_result += (
+                                                                    f"\n\n⚠️ Page {page_number} now has {page_count} submissions (rank {page_rank + 1}/{len(sorted_pages)})."
+                                                                    f" Please spend more time on pages with fewer submissions, such as: {least_pages}."
+                                                                    f"\nGlobal submission stats: {json.dumps(summary, ensure_ascii=False)}"
+                                                                )
+
+                                                self._log_tool_result(thread_id, function_name, {
+                                                    "count": submitted_count, 
+                                                    "remaining": remaining,
+                                                    "turns": turns,
+                                                    "messages": messages_array
+                                                })
                                     
                                 elif function_name == "exit":
                                     reason = function_args.get("reason", "Task completed")
@@ -1200,6 +1379,25 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                         tool_result = f"Error: Could not get page context"
                                         self._log_tool_result(thread_id, function_name, {"error": "Could not get context"})
                                     
+                                elif function_name == "search_text":
+                                    query = function_args["query"]
+                                    case_sensitive = function_args.get("case_sensitive", False)
+                                    results = page_manager.search_text(query, case_sensitive, max_results=20)
+                                    if results:
+                                        lines = [f"Found {len(results)} match(es):"]
+                                        for r in results:
+                                            lines.append(f"  Page {r['page_number']}, line {r['line_number']}: {r['content'][:120]}")
+                                        tool_result = "\n".join(lines)
+                                    else:
+                                        tool_result = f"No matches found for '{query}'"
+                                    self._log_tool_result(thread_id, function_name, {"query": query, "matches": len(results)})
+
+                                elif function_name == "get_page_access_summary":
+                                    limit = function_args.get("limit", 5)
+                                    summary = dataset_manager.get_page_submission_summary(limit=limit)
+                                    tool_result = json.dumps(summary, ensure_ascii=False, indent=2)
+                                    self._log_tool_result(thread_id, function_name, {"total_submissions": summary.get("total_submissions", 0)})
+
                                 elif function_name == "list_page_images" and self.extracted_dir:
                                     page_num = function_args["page_number"]
                                     page_dir = self.extracted_dir / f"page_{page_num:03d}"
@@ -1259,6 +1457,13 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                                         tool_result = f"Error calling {function_name}: {mcp_err}"
                                     self._log_tool_result(thread_id, function_name, {"result_preview": str(tool_result)[:80]})
 
+                                elif self.search1api_mcp and self.search1api_mcp.is_search1api_tool(function_name):
+                                    try:
+                                        tool_result = self.search1api_mcp.call_tool(thread_id, function_name, function_args)
+                                    except Exception as mcp_err:
+                                        tool_result = f"Error calling {function_name}: {mcp_err}"
+                                    self._log_tool_result(thread_id, function_name, {"result_preview": str(tool_result)[:80]})
+
                                 else:
                                     tool_result = f"Error: Unknown tool {function_name}"
                                     self._log_tool_result(thread_id, function_name, {"error": tool_result})
@@ -1277,7 +1482,7 @@ Remember: You MUST use the tools to accomplish this task. Start by calling jump_
                             if no_tool_call_count >= 2:
                                 # After 2 consecutive responses without tools, remind
                                 remaining = self.datasets_per_thread - submitted_count
-                                reminder = f"You haven't used any tools. You still need to submit {remaining} more Q&A pairs. Please use get_paragraph, move_forward, or move_backward to explore the document, then submit_dataset to save Q&A pairs. Call exit() when you reach {self.datasets_per_thread} submissions."
+                                reminder = f"You haven't used any tools. You still need to submit {remaining} more conversations. Please use get_current_page, next_page, or previous_page to explore the document, then submit_dataset to save conversations. Call exit when you reach {self.datasets_per_thread} submissions."
                                 
                                 if self.custom_prompt:
                                     reminder += f"\n\nREMINDER: {self.custom_prompt}"

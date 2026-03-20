@@ -190,12 +190,15 @@ async def _extract_async(
     with StatusIndicator() as status:
         # Determine if we need OCR based on file type and flags
         is_epub = input_path.is_file() and input_path.suffix.lower() == ".epub"
-        needs_ocr = not plain_text and not is_epub
+        is_pptx = input_path.is_file() and input_path.suffix.lower() == ".pptx"
+        needs_ocr = not plain_text and not is_epub and not is_pptx
         
         if plain_text:
             mode_label = "Plain Text"
         elif is_epub:
             mode_label = "EPUB (Plain Text)"
+        elif is_pptx:
+            mode_label = "PPTX (Plain Text)"
         else:
             mode_label = "local transformers" if mode == "local" else "API"
         status.print_info(f"Mode: {mode_label}")
@@ -204,7 +207,7 @@ async def _extract_async(
         status.print_info(f"Extracting text from: {input_path}")
 
         progress = None
-        if input_path.is_file() and input_path.suffix.lower() in [".pdf", ".epub"]:
+        if input_path.is_file() and input_path.suffix.lower() in [".pdf", ".epub", ".pptx"]:
             progress = OCRExtractor.load_progress(output_dir)
             if progress:
                 completed_pages = len(progress.get("completed_pages", []))
@@ -227,10 +230,15 @@ async def _extract_async(
         ) as extractor:
             if input_path.is_file():
                 # Check if it's a document (PDF/EPUB) or image
-                if input_path.suffix.lower() in [".pdf", ".epub"]:
-                    # EPUB always uses plain text extraction (no images to OCR)
+                if input_path.suffix.lower() in [".pdf", ".epub", ".pptx"]:
+                    # EPUB/PPTX always use plain text extraction (no images to OCR)
                     if input_path.suffix.lower() == ".epub":
                         status.print_info(f"Processing EPUB (plain text mode)")
+                        results = await extractor.extract_from_document(
+                            input_path, prefer_text=True, output_dir=output_dir
+                        )
+                    elif input_path.suffix.lower() == ".pptx":
+                        status.print_info(f"Processing PPTX (plain text mode)")
                         results = await extractor.extract_from_document(
                             input_path, prefer_text=True, output_dir=output_dir
                         )
@@ -371,6 +379,12 @@ async def _extract_async(
     default=None,
     help="MiniMax API key for MCP tools (web_search, understand_image). Auto-enabled when model name contains 'MiniMax'. Can also set MINIMAX_MCP_KEY env var.",
 )
+@click.option(
+    "--search1api-key",
+    envvar="SEARCH1API_KEY",
+    default=None,
+    help="Search1API key for web search MCP tools (search, news, crawl, etc.). Provides internet search capability for non-MiniMax models. Can also set SEARCH1API_KEY env var.",
+)
 def generate(
     extracted_dir: Path,
     db: Path,
@@ -388,6 +402,7 @@ def generate(
     max_messages: Optional[int],
     api_delay: float,
     minimax_mcp_key: Optional[str],
+    search1api_key: Optional[str],
 ) -> None:
     """Generate dataset using parallel LLM threads with MCP navigation.
 
@@ -434,6 +449,7 @@ def generate(
             max_messages,
             api_delay,
             minimax_mcp_key,
+            search1api_key,
         )
     )
 
@@ -455,6 +471,7 @@ async def _generate_async(
     max_messages: Optional[int],
     api_delay: float,
     minimax_mcp_key: Optional[str],
+    search1api_key: Optional[str],
 ) -> None:
     """Async implementation of parallel dataset generation."""
     from bookdatamaker.llm.parallel_generator import ParallelDatasetGenerator
@@ -503,6 +520,9 @@ async def _generate_async(
     if minimax_mcp_key and model and "minimax" in model.lower():
         click.echo(f"✓ MiniMax MCP tools enabled (web_search, understand_image)")
 
+    if search1api_key:
+        click.echo(f"✓ Search1API MCP tools enabled (search, news, crawl, etc.)")
+
     # Initialize parallel generator
     generator = ParallelDatasetGenerator(
         page_manager=page_manager,
@@ -522,6 +542,7 @@ async def _generate_async(
         api_delay=api_delay,
         extracted_dir=extracted_dir,
         minimax_mcp_key=minimax_mcp_key,
+        search1api_key=search1api_key,
     )
 
     click.echo(f"\nStarting {generator.num_threads} parallel threads")
@@ -705,6 +726,130 @@ def export_dataset(
                 
         except Exception as e:
             status.print_error(f"Export failed: {e}")
+            raise click.Abort()
+
+
+@cli.command()
+@click.argument("input_files", nargs=-1, required=True, type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Output file path (format auto-detected from extension)",
+)
+@click.option(
+    "--compression",
+    "-c",
+    type=click.Choice(["zstd", "snappy", "gzip", "brotli", "none"], case_sensitive=False),
+    default="zstd",
+    help="Compression method for Parquet output (default: zstd)",
+)
+@click.option(
+    "--deduplicate/--no-deduplicate",
+    default=False,
+    help="Remove duplicate entries based on message content",
+)
+def merge(
+    input_files: tuple,
+    output: Path,
+    compression: str,
+    deduplicate: bool,
+) -> None:
+    """Merge multiple dataset files into one.
+
+    INPUT_FILES: One or more source files (parquet/jsonl/csv/json, can mix formats)
+
+    Examples:
+        bookdatamaker merge a.parquet b.parquet -o merged.parquet
+        bookdatamaker merge a.jsonl b.parquet c.csv -o all.jsonl
+        bookdatamaker merge *.jsonl -o merged.parquet --deduplicate
+    """
+    from datasets import Dataset, concatenate_datasets
+    from bookdatamaker.utils import StatusIndicator
+
+    FORMAT_MAP = {
+        ".jsonl": "jsonl",
+        ".parquet": "parquet",
+        ".csv": "csv",
+        ".json": "json",
+    }
+
+    with StatusIndicator() as status:
+        out_ext = output.suffix.lower()
+        out_fmt = FORMAT_MAP.get(out_ext)
+        if out_fmt is None:
+            status.print_error(f"Unsupported output format: {out_ext}  (supported: {', '.join(FORMAT_MAP.keys())})")
+            raise click.Abort()
+
+        status.print_info(f"Merging {len(input_files)} files → {output}")
+
+        try:
+            datasets_list = []
+            total_rows = 0
+            for f in input_files:
+                ext = f.suffix.lower()
+                fmt = FORMAT_MAP.get(ext)
+                if fmt is None:
+                    status.print_warning(f"Skipping unsupported file: {f}")
+                    continue
+                if fmt == "parquet":
+                    ds = Dataset.from_parquet(str(f))
+                elif fmt in ("jsonl", "json"):
+                    ds = Dataset.from_json(str(f))
+                elif fmt == "csv":
+                    ds = Dataset.from_csv(str(f))
+                status.print_info(f"  Loaded {len(ds)} entries from {f.name}")
+                total_rows += len(ds)
+                datasets_list.append(ds)
+
+            if not datasets_list:
+                status.print_error("No valid input files")
+                raise click.Abort()
+
+            merged = concatenate_datasets(datasets_list)
+
+            if deduplicate:
+                import json as _json
+                seen = set()
+                keep_indices = []
+                for i in range(len(merged)):
+                    key = _json.dumps(merged[i]["messages"], ensure_ascii=False, sort_keys=True)
+                    if key not in seen:
+                        seen.add(key)
+                        keep_indices.append(i)
+                before = len(merged)
+                merged = merged.select(keep_indices)
+                removed = before - len(merged)
+                if removed:
+                    status.print_info(f"  Deduplicated: removed {removed} duplicates")
+
+            output.parent.mkdir(parents=True, exist_ok=True)
+
+            if out_fmt == "parquet":
+                merged.to_parquet(str(output))
+                status.print_info(f"Compression: {compression}")
+            elif out_fmt == "jsonl":
+                merged.to_json(str(output), orient="records", lines=True, force_ascii=False)
+            elif out_fmt == "csv":
+                merged.to_csv(str(output), index=False)
+            elif out_fmt == "json":
+                merged.to_json(str(output), orient="records", lines=False, force_ascii=False)
+
+            file_size = output.stat().st_size
+            if file_size < 1024:
+                size_str = f"{file_size} bytes"
+            elif file_size < 1024 * 1024:
+                size_str = f"{file_size / 1024:.2f} KB"
+            else:
+                size_str = f"{file_size / (1024 * 1024):.2f} MB"
+
+            status.print_success(f"Merged {total_rows} → {len(merged)} entries → {output}  ({size_str})")
+
+        except click.Abort:
+            raise
+        except Exception as e:
+            status.print_error(f"Merge failed: {e}")
             raise click.Abort()
 
 
