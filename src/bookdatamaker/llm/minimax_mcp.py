@@ -148,10 +148,15 @@ class MiniMaxMCPProxy:
     def close(self) -> None:
         """Shut down all MCP server processes."""
         for thread_id, ctx in self._sessions.items():
+            loop = ctx["loop"]
             try:
-                ctx["loop"].run_until_complete(ctx["cleanup"]())
-                ctx["loop"].close()
+                loop.run_until_complete(ctx["cleanup"]())
             except Exception:
                 pass
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
         self._sessions.clear()
         tqdm.write("[MiniMax MCP] All sessions closed")

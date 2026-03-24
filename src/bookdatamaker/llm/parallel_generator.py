@@ -363,7 +363,7 @@ class ParallelDatasetGenerator:
 Starting page: {start_page} | Total pages: {total_pages} | Target: {self.datasets_per_thread} conversations | Thread: {thread_id}
 
 # Tools
-Navigation: get_current_page, next_page(steps), previous_page(steps), jump_to_page(page_number), get_page_context(before, after)
+Navigation: get_current_page, next_page(steps), previous_page(steps), jump_to_page(page_number), get_page_context(before, after), get_page_range(start_page, end_page)
 Document search: search_text(query) — search WITHIN this document only (find keywords across pages)
 Coverage: get_page_access_summary(limit)
 Submission: submit_dataset(messages), exit(reason)"""
@@ -446,10 +446,17 @@ Target mix: ~30% single-turn (2 msgs), ~50% two-turn (4 msgs), ~20% three-turn+ 
 
 # Workflow
 1. jump_to_page({start_page}) to start
-2. Explore nearby pages with next_page / previous_page
+2. Use get_page_range(start_page, start_page+3) to read multiple pages at once
 3. Generate a conversation from the content
-4. submit_dataset to save it
+4. submit_dataset to save it, AND call next_page or get_page_range in the same response
 5. Repeat until {self.datasets_per_thread} submissions, then call exit
+
+# Efficiency Rules (IMPORTANT — each response = 1 API call)
+- Call MULTIPLE tools in a SINGLE response whenever possible to minimize API calls
+- Use get_page_range(start, end) to read 2-5 pages in one call instead of calling next_page repeatedly
+- After submit_dataset, immediately start navigating to the next section in the SAME response
+- Combine navigation + submission: e.g., submit_dataset AND get_page_range in one turn
+- MINIMIZE the number of response turns — batch your tool calls
 
 # Language
 Generate all conversations in the same language as the document content.
@@ -638,6 +645,27 @@ Start now: call jump_to_page({start_page})."""
                                 "default": 1
                             }
                         }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_page_range",
+                    "description": "Get content of multiple pages at once. More efficient than calling next_page repeatedly. Max 5 pages per call.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "start_page": {
+                                "type": "integer",
+                                "description": "Start page number (inclusive)"
+                            },
+                            "end_page": {
+                                "type": "integer",
+                                "description": "End page number (inclusive). Max 5 pages from start."
+                            }
+                        },
+                        "required": ["start_page", "end_page"]
                     }
                 }
             }
@@ -985,14 +1013,22 @@ Start now: call jump_to_page({start_page})."""
                     # Jump to saved position
                     page_manager.jump_to_page(current_position)
                     
-                    # Add resume message
-                    resume_msg = f"Session resumed. You have submitted {submitted_count}/{self.datasets_per_thread} Q&A pairs so far. You need {self.datasets_per_thread - submitted_count} more. Continue from current position (page {current_position})."
+                    # Append resume info to system prompt instead of injecting a user message
+                    remaining = self.datasets_per_thread - submitted_count
+                    resume_info = f"\n\n# SESSION RESUMED\nYou have submitted {submitted_count}/{self.datasets_per_thread} conversations. You need {remaining} more. Continue from page {current_position}."
                     if self.custom_prompt:
-                        resume_msg += f"\n\nREMINDER: {self.custom_prompt}"
-                    messages.append({
-                        "role": "user",
-                        "content": resume_msg
-                    })
+                        resume_info += f"\nREMINDER: {self.custom_prompt}"
+                    if messages and messages[0].get("role") == "system":
+                        messages[0]["content"] += resume_info
+                    
+                    # Ensure at least one user message exists after pruning
+                    # (API requires user message; pruning may leave only system msg)
+                    has_user = any(m.get("role") == "user" for m in messages)
+                    if not has_user:
+                        messages.append({
+                            "role": "user",
+                            "content": f"Continue the task. You have {remaining} conversations left. Start from page {current_position}."
+                        })
                 else:
                     # Start fresh
                     current_position = start_page
@@ -1049,6 +1085,12 @@ Start now: call jump_to_page({start_page})."""
                         # Add delay after API call if configured
                         if self.api_delay > 0:
                             time.sleep(self.api_delay)
+
+                        # Guard against non-standard API responses (e.g. raw strings)
+                        if not hasattr(response, 'choices') or not response.choices:
+                            with self.log_lock:
+                                tqdm.write(f"[Thread {thread_id}] ⚠️  Invalid API response (no choices), retrying...")
+                            continue
 
                         message = response.choices[0].message
                         
@@ -1279,17 +1321,6 @@ Start now: call jump_to_page({start_page})."""
                                         current_position = result["page_number"]
                                         tool_result = f"Page {result['page_number']} (of {result['total_pages']}):\n{result['content']}"
                                         self._log_tool_result(thread_id, function_name, {"page": result['page_number']})
-                                        
-                                        # Save position
-                                        dataset_manager.save_thread_state(
-                                            thread_id=thread_id,
-                                            start_position=start_page,
-                                            current_position=current_position,
-                                            submitted_count=submitted_count,
-                                            target_count=self.datasets_per_thread,
-                                            status="running",
-                                            messages=_serialize_messages(messages)
-                                        )
                                     else:
                                         tool_result = f"Error: Could not get current page"
                                         self._log_tool_result(thread_id, function_name, {"error": "Could not get current page"})
@@ -1302,17 +1333,6 @@ Start now: call jump_to_page({start_page})."""
                                         result = page_manager.get_page_info()
                                         tool_result = f"Page {page_num} (of {result['total_pages']}):\n{content}"
                                         self._log_tool_result(thread_id, function_name, {"page": page_num})
-                                        
-                                        # Save position after navigation
-                                        dataset_manager.save_thread_state(
-                                            thread_id=thread_id,
-                                            start_position=start_page,
-                                            current_position=current_position,
-                                            submitted_count=submitted_count,
-                                            target_count=self.datasets_per_thread,
-                                            status="running",
-                                            messages=_serialize_messages(messages)
-                                        )
                                     else:
                                         tool_result = f"Error: Page {page_num} not found"
                                         self._log_tool_result(thread_id, function_name, {"error": f"Page {page_num} not found"})
@@ -1325,17 +1345,6 @@ Start now: call jump_to_page({start_page})."""
                                         current_position = result["page_number"]
                                         tool_result = f"Moved to page {result['page_number']} (of {result['total_pages']}):\n{content}"
                                         self._log_tool_result(thread_id, function_name, {"to": result['page_number'], "steps": steps})
-                                        
-                                        # Save position after navigation
-                                        dataset_manager.save_thread_state(
-                                            thread_id=thread_id,
-                                            start_position=start_page,
-                                            current_position=current_position,
-                                            submitted_count=submitted_count,
-                                            target_count=self.datasets_per_thread,
-                                            status="running",
-                                            messages=_serialize_messages(messages)
-                                        )
                                     else:
                                         tool_result = f"Error: Could not move to next page"
                                         self._log_tool_result(thread_id, function_name, {"error": "Could not move forward"})
@@ -1348,20 +1357,31 @@ Start now: call jump_to_page({start_page})."""
                                         current_position = result["page_number"]
                                         tool_result = f"Moved to page {result['page_number']} (of {result['total_pages']}):\n{content}"
                                         self._log_tool_result(thread_id, function_name, {"to": result['page_number'], "steps": steps})
-                                        
-                                        # Save position after navigation
-                                        dataset_manager.save_thread_state(
-                                            thread_id=thread_id,
-                                            start_position=start_page,
-                                            current_position=current_position,
-                                            submitted_count=submitted_count,
-                                            target_count=self.datasets_per_thread,
-                                            status="running",
-                                            messages=_serialize_messages(messages)
-                                        )
                                     else:
                                         tool_result = f"Error: Could not move to previous page"
                                         self._log_tool_result(thread_id, function_name, {"error": "Could not move backward"})
+                                
+                                elif function_name == "get_page_range":
+                                    req_start = function_args["start_page"]
+                                    req_end = function_args["end_page"]
+                                    # Clamp to max 5 pages
+                                    if req_end - req_start + 1 > 5:
+                                        req_end = req_start + 4
+                                    pages_data = page_manager.get_page_range(req_start, req_end)
+                                    if pages_data:
+                                        # Update current position to the last page in range
+                                        last_page = max(pages_data.keys())
+                                        page_manager.jump_to_page(last_page)
+                                        current_position = last_page
+                                        parts = []
+                                        total = page_manager.get_total_pages()
+                                        for pn in sorted(pages_data.keys()):
+                                            parts.append(f"--- Page {pn} (of {total}) ---\n{pages_data[pn]}")
+                                        tool_result = "\n\n".join(parts)
+                                        self._log_tool_result(thread_id, function_name, {"pages": sorted(pages_data.keys())})
+                                    else:
+                                        tool_result = f"Error: No pages found in range {req_start}-{req_end}"
+                                        self._log_tool_result(thread_id, function_name, {"error": f"No pages in range {req_start}-{req_end}"})
                                 
                                 elif function_name == "get_page_context":
                                     before = function_args.get("before", 1)
@@ -1476,13 +1496,13 @@ Start now: call jump_to_page({start_page})."""
                                 })
                         
                         else:
-                            # No tool calls - remind the LLM to use tools
+                            # No tool calls - track and remind only after prolonged inaction
                             no_tool_call_count += 1
                             
-                            if no_tool_call_count >= 2:
-                                # After 2 consecutive responses without tools, remind
+                            if no_tool_call_count >= 4:
+                                # After 4 consecutive responses without tools, inject a minimal reminder
                                 remaining = self.datasets_per_thread - submitted_count
-                                reminder = f"You haven't used any tools. You still need to submit {remaining} more conversations. Please use get_current_page, next_page, or previous_page to explore the document, then submit_dataset to save conversations. Call exit when you reach {self.datasets_per_thread} submissions."
+                                reminder = f"You haven't used any tools. You still need to submit {remaining} more conversations. Please use get_current_page, next_page, get_page_range, or jump_to_page to explore the document, then submit_dataset to save conversations. Call exit when you reach {self.datasets_per_thread} submissions."
                                 
                                 if self.custom_prompt:
                                     reminder += f"\n\nREMINDER: {self.custom_prompt}"
@@ -1524,7 +1544,7 @@ Start now: call jump_to_page({start_page})."""
                                 tqdm.write(f"[Thread {thread_id}] ✂️  Pruned to {len(messages)} messages after API error")
                         
                         # Add error message to continue conversation
-                        error_msg = f"Error occurred. Please continue with the task."
+                        error_msg = "Error occurred. Please continue with the task."
                         if self.custom_prompt:
                             error_msg += f"\n\nREMINDER: {self.custom_prompt}"
                         messages.append({

@@ -169,8 +169,9 @@ class OCRExtractor:
 
         self.model = AutoModel.from_pretrained(
             self.local_model_path,
+            device_map="auto",
             **model_kwargs,
-        ).to(self.device)
+        )
         self.model = self.model.eval()
         
     def _filter_ocr_text(self, text: str) -> str:

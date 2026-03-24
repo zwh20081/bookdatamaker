@@ -409,6 +409,24 @@ class MCPServer:
                         },
                     ),
                     Tool(
+                        name="get_page_range",
+                        description="Get content of multiple pages at once. More efficient than calling next_page repeatedly. Max 5 pages per call.",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "start_page": {
+                                    "type": "integer",
+                                    "description": "Start page number (inclusive)",
+                                },
+                                "end_page": {
+                                    "type": "integer",
+                                    "description": "End page number (inclusive). Max 5 pages from start.",
+                                },
+                            },
+                            "required": ["start_page", "end_page"],
+                        },
+                    ),
+                    Tool(
                         name="get_document_stats",
                         description="Get document statistics (total lines, pages, etc.)",
                         inputSchema={
@@ -816,6 +834,24 @@ class MCPServer:
                 if isinstance(page_info, dict) and page_num is not None:
                     page_info["submission_count"] = self.page_submission_counts.get(page_num, 0)
                 return [TextContent(type="text", text=str(page_info))]
+
+            elif name == "get_page_range" and self.page_manager:
+                req_start = arguments["start_page"]
+                req_end = arguments["end_page"]
+                # Clamp to max 5 pages
+                if req_end - req_start + 1 > 5:
+                    req_end = req_start + 4
+                pages_data = self.page_manager.get_page_range(req_start, req_end)
+                if pages_data:
+                    last_page = max(pages_data.keys())
+                    self.page_manager.jump_to_page(last_page)
+                    self._record_page_access(list(pages_data.keys()))
+                    total = self.page_manager.get_total_pages()
+                    parts = []
+                    for pn in sorted(pages_data.keys()):
+                        parts.append(f"--- Page {pn} (of {total}) ---\n{pages_data[pn]}")
+                    return [TextContent(type="text", text="\n\n".join(parts))]
+                return [TextContent(type="text", text=f"No pages found in range {req_start}-{req_end}")]
 
             elif name == "get_page_context" and self.page_manager:
                 before = arguments.get("before", 1)

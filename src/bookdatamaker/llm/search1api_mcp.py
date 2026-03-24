@@ -132,10 +132,15 @@ class Search1APIMCPProxy:
     def close(self) -> None:
         """Shut down all MCP sessions."""
         for _thread_id, ctx in self._sessions.items():
+            loop = ctx["loop"]
             try:
-                ctx["loop"].run_until_complete(ctx["cleanup"]())
-                ctx["loop"].close()
+                loop.run_until_complete(ctx["cleanup"]())
             except Exception:
                 pass
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
         self._sessions.clear()
         tqdm.write("[Search1API MCP] All sessions closed")
