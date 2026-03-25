@@ -104,6 +104,9 @@ class TestPostProcessOCROutput:
     def _make_extractor(self):
         return OCRExtractor("fake-key", skip_model_load=True)
 
+    def _make_jpeg_extractor(self):
+        return OCRExtractor("fake-key", skip_model_load=True, image_format="jpeg", image_quality=95)
+
     def _make_image(self, width=999, height=999):
         """Create a test image."""
         return Image.new("RGB", (width, height), color=(200, 200, 200))
@@ -125,7 +128,7 @@ class TestPostProcessOCROutput:
 
     def test_image_ref_crops_and_replaces(self):
         """Image ref/det should crop the region and replace with markdown link."""
-        ext = self._make_extractor()
+        ext = self._make_jpeg_extractor()
         text = "Some text\n<|ref|>image<|/ref|><|det|>[[100,100],[500,500]]<|/det|>\nMore text"
         with tempfile.TemporaryDirectory() as tmpdir:
             page_dir = Path(tmpdir) / "page_001"
@@ -143,7 +146,7 @@ class TestPostProcessOCROutput:
 
     def test_non_image_ref_removed(self):
         """Non-image ref/det (e.g., title) should be removed entirely."""
-        ext = self._make_extractor()
+        ext = self._make_jpeg_extractor()
         text = "Hello <|ref|>title<|/ref|><|det|>[[0,0],[100,50]]<|/det|> world"
         with tempfile.TemporaryDirectory() as tmpdir:
             page_dir = Path(tmpdir) / "page_001"
@@ -159,7 +162,7 @@ class TestPostProcessOCROutput:
 
     def test_multiple_image_refs(self):
         """Multiple image refs should produce sequential numbered files."""
-        ext = self._make_extractor()
+        ext = self._make_jpeg_extractor()
         text = (
             "<|ref|>image<|/ref|><|det|>[[0,0],[499,499]]<|/det|>\n"
             "middle\n"
@@ -178,7 +181,7 @@ class TestPostProcessOCROutput:
 
     def test_coordinate_scaling(self):
         """Coordinates should scale from 0-999 range to actual image dimensions."""
-        ext = self._make_extractor()
+        ext = self._make_jpeg_extractor()
         # Image is 2000x1000, coords are 0-999
         text = "<|ref|>image<|/ref|><|det|>[[0,0],[999,999]]<|/det|>"
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -195,7 +198,7 @@ class TestPostProcessOCROutput:
 
     def test_mixed_refs(self):
         """Mix of image and non-image refs should handle both correctly."""
-        ext = self._make_extractor()
+        ext = self._make_jpeg_extractor()
         text = (
             "Title: <|ref|>heading<|/ref|><|det|>[[0,0],[100,50]]<|/det|>\n"
             "Figure: <|ref|>image<|/ref|><|det|>[[200,200],[800,800]]<|/det|>\n"
@@ -397,3 +400,24 @@ class TestExtractionResume:
 
         assert single_calls == [1, 2, 3]
         assert len(results) == 3
+
+
+def test_avif_fallback_to_jpeg_when_not_supported(monkeypatch):
+    """When AVIF is unavailable, extractor should auto-fallback to JPEG."""
+    monkeypatch.setattr("bookdatamaker.ocr.extractor.is_avif_supported", lambda: False)
+    ext = OCRExtractor("fake-key", skip_model_load=True, image_format="avif", image_quality=80)
+    assert ext.image_format == "jpeg"
+    assert ext.image_quality == 95
+
+
+def test_enable_timing_from_env(monkeypatch):
+    """Timing diagnostics should honor BOOKDATAMAKER_OCR_TIMING env flag."""
+    monkeypatch.setenv("BOOKDATAMAKER_OCR_TIMING", "1")
+    ext = OCRExtractor("fake-key", skip_model_load=True)
+    assert ext.enable_timing is True
+
+
+def test_format_seconds_readability():
+    """Timing formatter should render ms for sub-second and s for longer durations."""
+    assert OCRExtractor._format_seconds(0.0123).endswith("ms")
+    assert OCRExtractor._format_seconds(1.2).endswith("s")

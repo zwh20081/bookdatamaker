@@ -1,7 +1,5 @@
 """MCP server for paragraph and line/column navigation."""
 
-import base64
-import io
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
@@ -9,6 +7,13 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
+from bookdatamaker.tools.image_tools import get_image_data_url, list_page_images
+from bookdatamaker.tools.page_tools import PAGE_TOOL_NAMES, execute_page_tool
+from bookdatamaker.tools.registry import build_mcp_tool_specs
+from bookdatamaker.tools.submission_tools import (
+    build_page_access_summary,
+    validate_dataset_messages,
+)
 
 if TYPE_CHECKING:
     from ..utils.page_manager import PageManager
@@ -175,39 +180,6 @@ class MCPServer:
                 self.last_accessed_page = page_num
                 break
 
-    def _build_page_access_summary(self) -> Dict[str, Any]:
-        """Build summary of page access statistics."""
-        if not (self.page_manager and self.dataset_manager):
-            return {
-                "total_pages": 0,
-                "total_submissions": 0,
-                "page_submission_counts": {},
-            }
-        self._refresh_page_submission_state()
-
-        counts = {
-            page_num: self.page_submission_counts.get(page_num, 0)
-            for page_num in getattr(self.page_manager, "page_numbers", [])
-        }
-        sorted_pages = sorted(counts.items(), key=lambda item: (item[1], item[0]))
-        total_submissions = sum(counts.values())
-
-        least_viewed = [page for page, _ in sorted_pages[:5]] if sorted_pages else []
-        most_viewed = [page for page, _ in sorted_pages[-5:]] if sorted_pages else []
-
-        average_access = total_submissions / len(counts) if counts else 0.0
-
-        return {
-            "total_pages": len(counts),
-            "total_submissions": total_submissions,
-            "average_submissions_per_page": average_access,
-            "page_submission_counts": counts,
-            "least_submitted_pages": least_viewed,
-            "most_submitted_pages": most_viewed,
-            "last_submission_page": self.last_accessed_page,
-            "recommended_pages": [page for page in least_viewed if counts.get(page, 0) <= average_access],
-        }
-
     def _refresh_page_submission_state(self) -> None:
         """Reload submission counts from dataset manager."""
         if not self.dataset_manager:
@@ -226,6 +198,30 @@ class MCPServer:
                 self.last_accessed_page = int(last_page_value)
             except ValueError:
                 self.last_accessed_page = None
+
+    @staticmethod
+    def _append_registry_tools(
+        tools: List[Tool],
+        *,
+        include_page_manager_tools: bool,
+        include_image_tools: bool,
+        skip_names: Optional[set[str]] = None,
+    ) -> None:
+        """Append registry-built tools with optional skip list."""
+        skip_names = skip_names or set()
+        for spec in build_mcp_tool_specs(
+            include_page_manager_tools=include_page_manager_tools,
+            include_image_tools=include_image_tools,
+        ):
+            if spec["name"] in skip_names:
+                continue
+            tools.append(
+                Tool(
+                    name=spec["name"],
+                    description=spec["description"],
+                    inputSchema=spec["inputSchema"],
+                )
+            )
 
     def _setup_tools(self) -> None:
         """Set up MCP tools."""
@@ -303,151 +299,18 @@ class MCPServer:
                         "required": ["index"],
                     },
                 ),
-                Tool(
-                    name="submit_dataset",
-                    description="Submit a multi-turn conversation to the dataset. Provide an array of strings alternating between user and assistant messages (must start with user, end with assistant).",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "messages": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Array of message strings alternating user/assistant. Example: ['user message 1', 'assistant reply 1', 'user message 2', 'assistant reply 2']",
-                            }
-                        },
-                        "required": ["messages"],
-                    },
-                ),
-                Tool(
-                    name="exit",
-                    description="Exit the MCP session after completing the required number of dataset submissions. Use this when you have submitted the target number of Q&A pairs.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "reason": {
-                                "type": "string",
-                                "description": "Reason for exiting (e.g., 'Completed 10 dataset entries')",
-                            }
-                        },
-                        "required": ["reason"],
-                    },
-                ),
             ]
+
+            # Shared core dataset tools
+            self._append_registry_tools(
+                tools,
+                include_page_manager_tools=False,
+                include_image_tools=False,
+            )
 
             # Add page-based navigation tools if page_manager is available
             if self.page_manager:
                 tools.extend([
-                    Tool(
-                        name="get_current_page",
-                        description="Get the current page content with metadata (page number, total pages, etc.)",
-                        inputSchema={
-                            "type": "object",
-                            "properties": {},
-                        },
-                    ),
-                    Tool(
-                        name="next_page",
-                        description="Move to the next page(s) and return the new page content",
-                        inputSchema={
-                            "type": "object",
-                            "properties": {
-                                "steps": {
-                                    "type": "integer",
-                                    "description": "Number of pages to move forward",
-                                    "default": 1,
-                                }
-                            },
-                        },
-                    ),
-                    Tool(
-                        name="previous_page",
-                        description="Move to the previous page(s) and return the new page content",
-                        inputSchema={
-                            "type": "object",
-                            "properties": {
-                                "steps": {
-                                    "type": "integer",
-                                    "description": "Number of pages to move backward",
-                                    "default": 1,
-                                }
-                            },
-                        },
-                    ),
-                    Tool(
-                        name="jump_to_page",
-                        description="Jump to a specific page by page number",
-                        inputSchema={
-                            "type": "object",
-                            "properties": {
-                                "page_number": {
-                                    "type": "integer",
-                                    "description": "Target page number",
-                                }
-                            },
-                            "required": ["page_number"],
-                        },
-                    ),
-                    Tool(
-                        name="get_page_context",
-                        description="Get current page with surrounding pages for context",
-                        inputSchema={
-                            "type": "object",
-                            "properties": {
-                                "before": {
-                                    "type": "integer",
-                                    "description": "Number of pages before current",
-                                    "default": 1,
-                                },
-                                "after": {
-                                    "type": "integer",
-                                    "description": "Number of pages after current",
-                                    "default": 1,
-                                },
-                            },
-                        },
-                    ),
-                    Tool(
-                        name="get_page_range",
-                        description="Get content of multiple pages at once. More efficient than calling next_page repeatedly. Max 5 pages per call.",
-                        inputSchema={
-                            "type": "object",
-                            "properties": {
-                                "start_page": {
-                                    "type": "integer",
-                                    "description": "Start page number (inclusive)",
-                                },
-                                "end_page": {
-                                    "type": "integer",
-                                    "description": "End page number (inclusive). Max 5 pages from start.",
-                                },
-                            },
-                            "required": ["start_page", "end_page"],
-                        },
-                    ),
-                    Tool(
-                        name="get_document_stats",
-                        description="Get document statistics (total lines, pages, etc.)",
-                        inputSchema={
-                            "type": "object",
-                            "properties": {},
-                        },
-                    ),
-                    Tool(
-                        name="get_page_access_summary",
-                        description="Get global page access statistics so you can focus on under-explored pages",
-                        inputSchema={
-                            "type": "object",
-                            "properties": {
-                                "limit": {
-                                    "type": "integer",
-                                    "description": "Optional limit for how many least-viewed pages to highlight",
-                                    "default": 5,
-                                }
-                            },
-                        },
-                    ),
                     Tool(
                         name="get_line",
                         description="Get content of a specific line by line number",
@@ -527,30 +390,6 @@ class MCPServer:
                         },
                     ),
                     Tool(
-                        name="search_text",
-                        description="Search for text across the document",
-                        inputSchema={
-                            "type": "object",
-                            "properties": {
-                                "query": {
-                                    "type": "string",
-                                    "description": "Search query",
-                                },
-                                "case_sensitive": {
-                                    "type": "boolean",
-                                    "description": "Case-sensitive search",
-                                    "default": False,
-                                },
-                                "max_results": {
-                                    "type": "integer",
-                                    "description": "Maximum number of results",
-                                    "default": 100,
-                                },
-                            },
-                            "required": ["query"],
-                        },
-                    ),
-                    Tool(
                         name="get_page_info",
                         description="Get line range information for a specific page",
                         inputSchema={
@@ -566,42 +405,45 @@ class MCPServer:
                     ),
                 ])
 
+                # Shared core page tools
+                self._append_registry_tools(
+                    tools,
+                    include_page_manager_tools=True,
+                    include_image_tools=False,
+                    skip_names={
+                        "submit_dataset",
+                        "exit",
+                        "list_page_images",
+                        "get_image",
+                        "get_line",
+                        "get_line_range",
+                        "get_line_with_context",
+                        "get_column_range",
+                        "get_page_info",
+                        "get_document_stats",
+                    },
+                )
+
+                # Keep get_document_stats local (not in shared registry yet)
+                tools.append(
+                    Tool(
+                        name="get_document_stats",
+                        description="Get document statistics (total lines, pages, etc.)",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {},
+                        },
+                    )
+                )
+
             # Add image tools if extracted_dir is available
             if self.extracted_dir:
-                tools.extend([
-                    Tool(
-                        name="list_page_images",
-                        description="List available images for a specific page with absolute file paths, including cropped figures and the full page image",
-                        inputSchema={
-                            "type": "object",
-                            "properties": {
-                                "page_number": {
-                                    "type": "integer",
-                                    "description": "Page number to list images for",
-                                }
-                            },
-                            "required": ["page_number"],
-                        },
-                    ),
-                    Tool(
-                        name="get_image",
-                        description="Get a specific image as base64 data URL. Use list_page_images first to see available images.",
-                        inputSchema={
-                            "type": "object",
-                            "properties": {
-                                "page_number": {
-                                    "type": "integer",
-                                    "description": "Page number",
-                                },
-                                "image_name": {
-                                    "type": "string",
-                                    "description": "Image filename (e.g., 'images/0.jpg' for cropped image, 'page_001.png' for full page)",
-                                },
-                            },
-                            "required": ["page_number", "image_name"],
-                        },
-                    ),
-                ])
+                self._append_registry_tools(
+                    tools,
+                    include_page_manager_tools=False,
+                    include_image_tools=True,
+                    skip_names={"submit_dataset", "exit"},
+                )
 
             return tools
 
@@ -728,22 +570,11 @@ class MCPServer:
             
             elif name == "submit_dataset":
                 messages = arguments.get("messages", [])
-                
-                # Validate messages format
-                if not messages:
+                validation_error = validate_dataset_messages(messages)
+                if validation_error:
                     response = {
                         "status": "error",
-                        "message": "messages array cannot be empty"
-                    }
-                elif len(messages) < 2:
-                    response = {
-                        "status": "error",
-                        "message": "messages must contain at least one user-assistant pair (minimum 2 messages)"
-                    }
-                elif len(messages) % 2 != 0:
-                    response = {
-                        "status": "error",
-                        "message": "messages must have even length (alternating user-assistant pairs)"
+                        "message": validation_error,
                     }
                 # Save to database if dataset_manager is available
                 elif self.dataset_manager:
@@ -791,88 +622,52 @@ class MCPServer:
                 return [TextContent(type="text", text=str(response))]
 
             # Page-based navigation tools
-            elif name == "get_current_page" and self.page_manager:
-                self._refresh_page_submission_state()
-                page_info = self.page_manager.get_page_info()
-                page_num = page_info.get("page_number") if isinstance(page_info, dict) else None
-                self._record_page_access([page_num])
-                if isinstance(page_info, dict) and page_num is not None:
-                    page_info["submission_count"] = self.page_submission_counts.get(page_num, 0)
-                return [TextContent(type="text", text=str(page_info))]
+            elif name in PAGE_TOOL_NAMES and self.page_manager:
+                shared = execute_page_tool(
+                    self.page_manager,
+                    name,
+                    arguments,
+                    default_search_max_results=100,
+                )
+                if not shared.get("ok"):
+                    return [TextContent(type="text", text=shared.get("error", "Unknown tool error"))]
 
-            elif name == "next_page" and self.page_manager:
-                steps = arguments.get("steps", 1)
-                self.page_manager.next_page(steps)
                 self._refresh_page_submission_state()
-                page_info = self.page_manager.get_page_info()
-                page_num = page_info.get("page_number") if isinstance(page_info, dict) else None
-                self._record_page_access([page_num])
-                if isinstance(page_info, dict) and page_num is not None:
-                    page_info["submission_count"] = self.page_submission_counts.get(page_num, 0)
-                return [TextContent(type="text", text=str(page_info))]
+                self._record_page_access(shared.get("pages_touched", []))
 
-            elif name == "previous_page" and self.page_manager:
-                steps = arguments.get("steps", 1)
-                self.page_manager.previous_page(steps)
-                self._refresh_page_submission_state()
-                page_info = self.page_manager.get_page_info()
-                page_num = page_info.get("page_number") if isinstance(page_info, dict) else None
-                self._record_page_access([page_num])
-                if isinstance(page_info, dict) and page_num is not None:
-                    page_info["submission_count"] = self.page_submission_counts.get(page_num, 0)
-                return [TextContent(type="text", text=str(page_info))]
+                if name in {"get_current_page", "jump_to_page", "next_page", "previous_page"}:
+                    page_info = shared["page_info"]
+                    page_num = page_info.get("page_number")
+                    if page_num is not None:
+                        page_info["submission_count"] = self.page_submission_counts.get(page_num, 0)
+                    return [TextContent(type="text", text=str(page_info))]
 
-            elif name == "jump_to_page" and self.page_manager:
-                page_number = arguments["page_number"]
-                content = self.page_manager.jump_to_page(page_number)
-                if content is None:
-                    return [TextContent(type="text", text=f"Page {page_number} not found")]
-                self._refresh_page_submission_state()
-                page_info = self.page_manager.get_page_info()
-                page_num = page_info.get("page_number") if isinstance(page_info, dict) else None
-                self._record_page_access([page_num])
-                if isinstance(page_info, dict) and page_num is not None:
-                    page_info["submission_count"] = self.page_submission_counts.get(page_num, 0)
-                return [TextContent(type="text", text=str(page_info))]
-
-            elif name == "get_page_range" and self.page_manager:
-                req_start = arguments["start_page"]
-                req_end = arguments["end_page"]
-                # Clamp to max 5 pages
-                if req_end - req_start + 1 > 5:
-                    req_end = req_start + 4
-                pages_data = self.page_manager.get_page_range(req_start, req_end)
-                if pages_data:
-                    last_page = max(pages_data.keys())
-                    self.page_manager.jump_to_page(last_page)
-                    self._record_page_access(list(pages_data.keys()))
-                    total = self.page_manager.get_total_pages()
-                    parts = []
-                    for pn in sorted(pages_data.keys()):
-                        parts.append(f"--- Page {pn} (of {total}) ---\n{pages_data[pn]}")
+                if name == "get_page_range":
+                    pages_data = shared["pages_data"]
+                    total = shared["total_pages"]
+                    parts = [
+                        f"--- Page {pn} (of {total}) ---\n{pages_data[pn]}"
+                        for pn in sorted(pages_data.keys())
+                    ]
                     return [TextContent(type="text", text="\n\n".join(parts))]
-                return [TextContent(type="text", text=f"No pages found in range {req_start}-{req_end}")]
 
-            elif name == "get_page_context" and self.page_manager:
-                before = arguments.get("before", 1)
-                after = arguments.get("after", 1)
-                current_page = self.page_manager.get_current_page_number()
-                self._refresh_page_submission_state()
-                context = self.page_manager.get_context(current_page, before, after)
-                pages_viewed = {
-                    page
-                    for page in [context.get("current_page")]
-                    if page is not None
-                }
-                pages_viewed.update(context.get("previous_pages", {}).keys())
-                pages_viewed.update(context.get("next_pages", {}).keys())
-                pages_list = list(pages_viewed)
-                self._record_page_access(pages_list)
-                context["submission_counts"] = {
-                    page: self.page_submission_counts.get(page, 0)
-                    for page in pages_list
-                }
-                return [TextContent(type="text", text=str(context))]
+                if name == "get_page_context":
+                    context = shared["context"]
+                    pages_list = shared.get("pages_touched", [])
+                    context["submission_counts"] = {
+                        page: self.page_submission_counts.get(page, 0)
+                        for page in pages_list
+                    }
+                    return [TextContent(type="text", text=str(context))]
+
+                if name == "search_text":
+                    results = shared["results"]
+                    for result in results:
+                        para_num = self.page_manager.get_paragraph_number(result["line_number"])
+                        result["paragraph_number"] = para_num
+                    return [TextContent(type="text", text=str(results))]
+
+                return [TextContent(type="text", text=f"Unsupported tool response for {name}")]
 
             # Line/column navigation tools
             elif name == "get_document_stats" and self.page_manager:
@@ -880,14 +675,15 @@ class MCPServer:
                 return [TextContent(type="text", text=str(stats))]
 
             elif name == "get_page_access_summary" and self.page_manager:
-                summary = self._build_page_access_summary()
+                self._refresh_page_submission_state()
                 limit = arguments.get("limit", 5)
-                # Highlight least-viewed pages up to provided limit
-                least_viewed = sorted(
-                    summary.get("page_submission_counts", {}).items(),
-                    key=lambda item: (item[1], item[0])
+                page_numbers = list(getattr(self.page_manager, "page_numbers", []))
+                summary = build_page_access_summary(
+                    counts=self.page_submission_counts,
+                    page_numbers=page_numbers,
+                    last_submission_page=self.last_accessed_page,
+                    limit=limit,
                 )
-                summary["least_submitted_pages"] = [page for page, _ in least_viewed[:limit]]
                 return [TextContent(type="text", text=json.dumps(summary, ensure_ascii=False, indent=2))]
 
             elif name == "get_line" and self.page_manager:
@@ -989,20 +785,6 @@ class MCPServer:
                 )
                 return [TextContent(type="text", text=str(response))]
 
-            elif name == "search_text" and self.page_manager:
-                query = arguments["query"]
-                case_sensitive = arguments.get("case_sensitive", False)
-                max_results = arguments.get("max_results", 100)
-                results = self.page_manager.search_text(query, case_sensitive, max_results)
-                
-                # Each result already has line_number, page_number, paragraph info
-                # Add paragraph_number to each result
-                for result in results:
-                    para_num = self.page_manager.get_paragraph_number(result["line_number"])
-                    result["paragraph_number"] = para_num
-                
-                return [TextContent(type="text", text=str(results))]
-
             elif name == "get_page_info" and self.page_manager:
                 page_num = arguments["page_number"]
                 self._refresh_page_submission_state()
@@ -1016,105 +798,31 @@ class MCPServer:
             # Image tools
             elif name == "list_page_images" and self.extracted_dir:
                 page_num = arguments["page_number"]
-                page_dir = self._get_page_dir(page_num)
-                if page_dir is None:
-                    return [TextContent(type="text", text=f"Page {page_num} not found")]
-                
-                available_images = []
-                
-                # Check for full page image
-                for ext in (".png", ".jpg", ".jpeg"):
-                    page_img = page_dir / f"page_{page_num:03d}{ext}"
-                    if page_img.exists():
-                        available_images.append({
-                            "name": page_img.name,
-                            "type": "full_page",
-                            "path": str(page_img.resolve()),
-                        })
-                        break
-                
-                # Check for cropped images
-                images_dir = page_dir / "images"
-                if images_dir.is_dir():
-                    for img_file in sorted(images_dir.iterdir()):
-                        if img_file.suffix.lower() in (".jpg", ".jpeg", ".png"):
-                            available_images.append({
-                                "name": f"images/{img_file.name}",
-                                "type": "cropped",
-                                "path": str(img_file.resolve()),
-                            })
-                
+                result = list_page_images(self.extracted_dir, page_num)
+                if not result.get("ok"):
+                    return [TextContent(type="text", text=result.get("error", f"Page {page_num} not found"))]
                 response = {
-                    "page_number": page_num,
-                    "image_count": len(available_images),
-                    "images": available_images,
+                    "page_number": result["page_number"],
+                    "image_count": result["image_count"],
+                    "images": result["images"],
                 }
                 return [TextContent(type="text", text=json.dumps(response, ensure_ascii=False))]
 
             elif name == "get_image" and self.extracted_dir:
                 page_num = arguments["page_number"]
                 image_name = arguments["image_name"]
-                page_dir = self._get_page_dir(page_num)
-                if page_dir is None:
-                    return [TextContent(type="text", text=f"Page {page_num} not found")]
-                
-                image_path = page_dir / image_name
-                if not image_path.exists():
-                    return [TextContent(type="text", text=f"Image '{image_name}' not found in page {page_num}")]
-                
-                # Security: ensure path stays within page_dir
-                try:
-                    image_path.resolve().relative_to(page_dir.resolve())
-                except ValueError:
-                    return [TextContent(type="text", text="Invalid image path")]
-                
-                data_url = self._encode_image_to_base64(image_path)
+                result = get_image_data_url(self.extracted_dir, page_num, image_name)
+                if not result.get("ok"):
+                    return [TextContent(type="text", text=result.get("error", "Image load error"))]
                 response = {
-                    "page_number": page_num,
-                    "image_name": image_name,
-                    "data_url": data_url,
+                    "page_number": result["page_number"],
+                    "image_name": result["image_name"],
+                    "data_url": result["data_url"],
                 }
                 return [TextContent(type="text", text=json.dumps(response, ensure_ascii=False))]
 
             else:
                 raise ValueError(f"Unknown tool: {name}")
-
-    def _encode_image_to_base64(self, image_path: Path) -> str:
-        """Encode image file to base64 data URL.
-        
-        Args:
-            image_path: Path to image file
-            
-        Returns:
-            Base64 data URL string
-        """
-        from PIL import Image
-
-        with Image.open(image_path) as img:
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            buffer = io.BytesIO()
-            img.save(buffer, format="JPEG")
-            img_bytes = buffer.getvalue()
-
-        base64_str = base64.b64encode(img_bytes).decode("utf-8")
-        return f"data:image/jpeg;base64,{base64_str}"
-
-    def _get_page_dir(self, page_number: int) -> Optional[Path]:
-        """Get page directory path for a given page number.
-        
-        Args:
-            page_number: Page number
-            
-        Returns:
-            Path to page directory, or None if not found
-        """
-        if not self.extracted_dir:
-            return None
-        page_dir = self.extracted_dir / f"page_{page_number:03d}"
-        if page_dir.is_dir():
-            return page_dir
-        return None
 
     async def run(self) -> None:
         """Run the MCP server."""

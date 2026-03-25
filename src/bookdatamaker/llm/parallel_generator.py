@@ -15,55 +15,26 @@ from rich.console import Console
 from rich.panel import Panel
 
 from bookdatamaker.dataset.dataset_manager import DatasetManager, DuplicateEntryError, DEFAULT_DUPLICATE_THRESHOLD
+from bookdatamaker.llm.message_utils import (
+    extract_think,
+    safe_prune_messages,
+    sanitize_tool_pairs,
+    serialize_messages,
+)
+from bookdatamaker.llm.prompt_builder import create_system_prompt as build_system_prompt
+from bookdatamaker.tools.image_tools import get_image_data_url, list_page_images
+from bookdatamaker.tools.page_tools import PAGE_TOOL_NAMES, execute_page_tool
+from bookdatamaker.tools.registry import build_openai_tool_defs
+from bookdatamaker.tools.submission_tools import (
+    build_page_access_summary,
+    compute_remaining_submissions,
+    validate_dataset_messages,
+)
 from bookdatamaker.utils.page_manager import PageManager
 
 WARNING_SIMILARITY_THRESHOLD = 50.0
 
 console = Console()
-
-
-def _serialize_messages(messages: List[dict]) -> List[dict]:
-    """Serialize messages to JSON-compatible format.
-    
-    Converts OpenAI tool_calls objects to dictionaries.
-    
-    Args:
-        messages: List of message dictionaries
-        
-    Returns:
-        JSON-serializable list of messages
-    """
-    serialized = []
-    for msg in messages:
-        msg_copy = msg.copy()
-        
-        # Convert tool_calls to dict if present
-        if "tool_calls" in msg_copy and msg_copy["tool_calls"]:
-            tool_calls_list = []
-            for tc in msg_copy["tool_calls"]:
-                # Check if already a dict (from restored state)
-                if isinstance(tc, dict):
-                    tool_calls_list.append(tc)
-                # Convert ChatCompletionMessageToolCall to dict
-                elif hasattr(tc, "model_dump"):
-                    tool_calls_list.append(tc.model_dump())
-                elif hasattr(tc, "dict"):
-                    tool_calls_list.append(tc.dict())
-                else:
-                    # Manual conversion for objects
-                    tool_calls_list.append({
-                        "id": tc.id,
-                        "type": tc.type,
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        }
-                    })
-            msg_copy["tool_calls"] = tool_calls_list
-        
-        serialized.append(msg_copy)
-    
-    return serialized
 
 
 class ParallelDatasetGenerator:
@@ -152,103 +123,6 @@ class ParallelDatasetGenerator:
                 self.pbar.update(increment)
                 self.current_progress += increment
     
-    @staticmethod
-    def _extract_think(content: str):
-        """Extract <think> blocks and remaining text from content.
-        
-        Returns:
-            (think_text, visible_text) where think_text is the concatenated
-            content inside <think> tags (or empty string) and visible_text
-            is the remaining content.
-        """
-        import re
-        think_parts = re.findall(r'<think>(.*?)</think>', content, re.DOTALL)
-        visible = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-        return '\n'.join(t.strip() for t in think_parts if t.strip()), visible
-
-    @staticmethod
-    def _safe_prune_messages(messages: list, keep_last: int = 10) -> list:
-        """Prune messages while keeping system msg and avoiding orphaned tool_calls.
-        
-        Ensures that assistant messages with tool_calls always have their
-        corresponding tool response messages, which many APIs require.
-        
-        Args:
-            messages: Full message list
-            keep_last: Target number of recent messages to keep
-            
-        Returns:
-            Pruned message list
-        """
-        if len(messages) <= keep_last + 1:
-            # Still sanitize even short lists (could have incomplete tool blocks)
-            return ParallelDatasetGenerator._sanitize_tool_pairs(messages)
-        
-        system_msg = messages[0] if messages and messages[0]["role"] == "system" else None
-        start_idx = 1 if system_msg else 0
-        
-        # Take the last keep_last messages
-        candidate = messages[-keep_last:]
-        
-        # If the first message is a "tool" role, we need to find the preceding
-        # assistant message with tool_calls. Walk backwards from the cut point
-        # to include the full tool_calls group.
-        cut_point = len(messages) - keep_last
-        while candidate and candidate[0].get("role") == "tool" and cut_point > start_idx:
-            cut_point -= 1
-            candidate = messages[cut_point:]
-        
-        result = ([system_msg] if system_msg else []) + candidate
-        # Validate all tool_call/tool_result pairs are complete
-        return ParallelDatasetGenerator._sanitize_tool_pairs(result)
-
-    @staticmethod
-    def _sanitize_tool_pairs(messages: list) -> list:
-        """Remove incomplete tool_call/tool_result groups from message list.
-        
-        Ensures every assistant message with tool_calls has ALL its
-        corresponding tool result messages immediately following it.
-        Drops any incomplete groups to prevent API errors.
-        
-        Args:
-            messages: Message list to sanitize
-            
-        Returns:
-            Sanitized message list with complete tool_call pairs only
-        """
-        result = []
-        i = 0
-        while i < len(messages):
-            msg = messages[i]
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                # Collect expected tool_call_ids
-                tool_calls = msg["tool_calls"]
-                expected_ids = set()
-                for tc in tool_calls:
-                    if isinstance(tc, dict):
-                        expected_ids.add(tc["id"])
-                    else:
-                        expected_ids.add(tc.id)
-                
-                # Collect following tool result messages
-                j = i + 1
-                found_ids = set()
-                while j < len(messages) and messages[j].get("role") == "tool":
-                    found_ids.add(messages[j].get("tool_call_id"))
-                    j += 1
-                
-                if expected_ids <= found_ids:
-                    # Complete block — keep assistant + all tool results
-                    result.append(msg)
-                    for k in range(i + 1, j):
-                        result.append(messages[k])
-                # else: incomplete block — skip assistant + partial tool results
-                i = j
-            else:
-                result.append(msg)
-                i += 1
-        return result
-
     def _log_llm_output(self, thread_id: int, content: str, tool_calls: list = None) -> None:
         """Log LLM output in a thread-safe manner.
         
@@ -259,7 +133,7 @@ class ParallelDatasetGenerator:
         """
         with self.log_lock:
             if content and content.strip():
-                think_text, visible_text = self._extract_think(content)
+                think_text, visible_text = extract_think(content)
                 if think_text:
                     short_think = think_text[:150] + "..." if len(think_text) > 150 else think_text
                     tqdm.write(f"[Thread {thread_id}] 💭 Think: {short_think}")
@@ -356,169 +230,16 @@ class ParallelDatasetGenerator:
         Returns:
             System prompt text
         """
-        total_pages = self.page_manager.get_total_pages()
-        base_prompt = f"""You are a dataset generation assistant. Your job is to read a document via tools and produce high-quality multi-turn conversations.
-
-# Task
-Starting page: {start_page} | Total pages: {total_pages} | Target: {self.datasets_per_thread} conversations | Thread: {thread_id}
-
-# Tools
-Navigation: get_current_page, next_page(steps), previous_page(steps), jump_to_page(page_number), get_page_context(before, after), get_page_range(start_page, end_page)
-Document search: search_text(query) — search WITHIN this document only (find keywords across pages)
-Coverage: get_page_access_summary(limit)
-Submission: submit_dataset(messages), exit(reason)"""
-
-        if self.extracted_dir:
-            base_prompt += "\nImages: list_page_images(page_number)"
-            if not self.minimax_mcp:
-                base_prompt += ", get_image(page_number, image_name)"
-
-        if self.minimax_mcp:
-            base_prompt += "\nInternet search: minimax_web_search — search the REAL INTERNET for external information (NOT the document)"
-            base_prompt += "\nImage analysis: minimax_understand_image(image_url) — analyze an image file"
-
-        if self.search1api_mcp:
-            base_prompt += "\nInternet search: search1api_search(query) — search the REAL INTERNET via Search1API"
-            base_prompt += "\nNews search: search1api_news(query) — search for latest news articles"
-            base_prompt += "\nWeb crawl: search1api_crawl(url) — extract content from a URL"
-
-        if self.minimax_mcp:
-            base_prompt += """
-
-# IMPORTANT: search_text vs minimax_web_search
-- search_text: Searches ONLY within this document. Use it to find where a keyword appears in the document pages.
-- minimax_web_search: Searches the REAL INTERNET. Use it to find external examples, latest news, real-world cases, industry data.
-They are completely different tools. Do NOT confuse them.
-
-# Web Search Enhancement (STRONGLY ENCOURAGED)
-You have minimax_web_search for INTERNET search — USE IT ACTIVELY:
-- After reading document content, call minimax_web_search to find real-world examples, latest developments, or case studies
-- Combine document knowledge with web-sourced examples to create richer, more practical conversations
-- For general principles, web-search for concrete application scenarios or success/failure cases
-- For industry-specific content, web-search for recent trends, data, or news to supplement the document
-- Aim to use minimax_web_search at least once every 2-3 submissions
-- The best conversations blend document theory with real-world evidence found via internet search"""
-
-        if self.search1api_mcp and not self.minimax_mcp:
-            base_prompt += """
-
-# IMPORTANT: search_text vs search1api_search
-- search_text: Searches ONLY within this document. Use it to find where a keyword appears in the document pages.
-- search1api_search: Searches the REAL INTERNET via Search1API. Use it to find external examples, latest news, real-world cases, industry data.
-- search1api_news: Searches for NEWS ARTICLES on the internet. Use for recent events, trends and developments.
-They are completely different tools from search_text. Do NOT confuse them.
-
-# Web Search Enhancement (STRONGLY ENCOURAGED)
-You have search1api_search and search1api_news for INTERNET search — USE THEM ACTIVELY:
-- After reading document content, call search1api_search to find real-world examples, latest developments, or case studies
-- Combine document knowledge with web-sourced examples to create richer, more practical conversations
-- For general principles, web-search for concrete application scenarios or success/failure cases
-- For industry-specific content, use search1api_news for recent trends, data, or news to supplement the document
-- Aim to use search1api_search or search1api_news at least once every 2-3 submissions
-- The best conversations blend document theory with real-world evidence found via internet search"""
-
-        if self.search1api_mcp and self.minimax_mcp:
-            base_prompt += """
-
-# IMPORTANT: search_text vs search1api_search
-- search_text: Searches ONLY within this document.
-- search1api_search / search1api_news: Searches the REAL INTERNET via Search1API (alternative to minimax_web_search).
-You can use either minimax_web_search or search1api_search for internet lookups."""
-
-        if self.extracted_dir and self.minimax_mcp:
-            base_prompt += """
-
-# Image Workflow
-When you see image references like ![](images/0.jpg) in page content:
-1. Call list_page_images → get absolute file paths
-2. Call minimax_understand_image with the file path as image_url
-3. Incorporate the image analysis into your conversation"""
-
-        base_prompt += f"""
-
-# submit_dataset Format
-Provide a "messages" array of alternating user/assistant strings:
-- Start with user, end with assistant
-- Single-turn: ["What is X?", "X is..."]
-- Multi-turn: ["What is X?", "X is...", "Can you elaborate?", "Sure, X also..."]
-
-Target mix: ~30% single-turn (2 msgs), ~50% two-turn (4 msgs), ~20% three-turn+ (6+ msgs)
-
-# Workflow
-1. jump_to_page({start_page}) to start
-2. Use get_page_range(start_page, start_page+3) to read multiple pages at once
-3. Generate a conversation from the content
-4. submit_dataset to save it, AND call next_page or get_page_range in the same response
-5. Repeat until {self.datasets_per_thread} submissions, then call exit
-
-# Efficiency Rules (IMPORTANT — each response = 1 API call)
-- Call MULTIPLE tools in a SINGLE response whenever possible to minimize API calls
-- Use get_page_range(start, end) to read 2-5 pages in one call instead of calling next_page repeatedly
-- After submit_dataset, immediately start navigating to the next section in the SAME response
-- Combine navigation + submission: e.g., submit_dataset AND get_page_range in one turn
-- MINIMIZE the number of response turns — batch your tool calls
-
-# Language
-Generate all conversations in the same language as the document content.
-
-# Quality Rules
-
-## Self-Contained Content (CRITICAL)
-All content MUST be standalone — no meta-references to any source.
-- ❌ NEVER: "根据文本", "文中提到", "文章指出", "上文说明", "原文描述", "according to the text", "the document states"
-- ❌ NEVER reference "the document/text/material/passage/article/book"
-- ✅ Present information as direct knowledge
-- ✅ Questions = natural topic inquiries; Answers = direct explanations
-
-Examples:
-- ❌ "根据文本，光合作用是植物..." → ✅ "光合作用是植物通过叶绿素..."
-- ❌ "What does the text say about X?" → ✅ "How does X work?"
-
-## Answer Quality
-- Answers should be 50-300 words with substantive explanations
-- Be accurate and faithful to the source material
-- Include all necessary context within each answer
-- **Maximize context depth**: Each answer should be as comprehensive as possible. Before generating a conversation, read multiple consecutive pages (call next_page 2-3 times) to gather enough context. A well-informed answer that synthesizes information across pages is far more valuable than a shallow one from a single page.
-
-## Proactive Exploration
-- Do NOT generate a conversation from just one page when the topic spans multiple pages
-- Before writing a conversation, call next_page or get_page_context to check if the topic continues
-- Combine information from 2-4 pages into one rich, deep conversation
-- If a page ends mid-topic, ALWAYS read the next page before submitting
-
-## Reasoning & Inference (IMPORTANT)
-- Do NOT merely copy or paraphrase the document content
-- Use the document as a foundation, then REASON about it to produce deeper insights:
-  - Draw connections between concepts from different parts of the document
-  - Generate "why" and "how" questions that require analytical thinking
-  - Create conversations that explore implications, comparisons, or applications not directly stated
-  - Synthesize information from multiple pages into a unified explanation
-- Example: If the document describes technique A on page 5 and technique B on page 12, you could create a conversation comparing the two, discussing when each is more appropriate — this is new knowledge derived from reasoning
-
-## Content Adaptation
-For specific events/cases (事件、案例): Include FULL context — background, timeline, participants, outcome. Preserve names, dates, numbers.
-For general principles (原理、概念): Submit SEPARATE conversations exploring different angles — definition, application, examples, edge cases.
-
-## Coverage
-- After every 3 submissions, call get_page_access_summary to check coverage
-- If your current area has high submission counts, jump to under-explored pages
-- Use search_text to find specific topics across the document when relevant
-
-## Error Recovery
-- If submit_dataset returns a duplicate error, skip that topic and move to different pages
-- If a page has little useful content, call next_page immediately
-
-## Skip These Pages
-Do NOT generate conversations from: table of contents, indexes, references/bibliography, blank pages, publication metadata (title, author, publisher, ISBN, edition, copyright).
-直接调用 next_page 跳过这些页面。
-
-Start now: call jump_to_page({start_page})."""
-        
-        # Append custom prompt if provided
-        if self.custom_prompt:
-            base_prompt += f"\n\nADDITIONAL INSTRUCTIONS:\n{self.custom_prompt}"
-        
-        return base_prompt
+        return build_system_prompt(
+            start_page=start_page,
+            thread_id=thread_id,
+            total_pages=self.page_manager.get_total_pages(),
+            datasets_per_thread=self.datasets_per_thread,
+            extracted_dir=self.extracted_dir,
+            has_minimax_mcp=bool(self.minimax_mcp),
+            has_search1api_mcp=bool(self.search1api_mcp),
+            custom_prompt=self.custom_prompt,
+        )
     
     def _get_mcp_tools(self) -> list:
         """Get MCP tool definitions for OpenAI function calling.
@@ -526,246 +247,16 @@ Start now: call jump_to_page({start_page})."""
         Returns:
             List of tool definitions
         """
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "submit_dataset",
-                    "description": "Submit a multi-turn conversation to the dataset. Provide an array of strings alternating between user and assistant messages.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "messages": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Array of message strings alternating user/assistant. Must start with user, end with assistant. Example: ['user msg 1', 'assistant reply 1', 'user msg 2', 'assistant reply 2']"
-                            }
-                        },
-                        "required": ["messages"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "exit",
-                    "description": "Exit after completing the required number of submissions",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "reason": {
-                                "type": "string",
-                                "description": "Reason for exiting"
-                            }
-                        },
-                        "required": ["reason"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_current_page",
-                    "description": "Get the current page content with metadata",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {}
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "next_page",
-                    "description": "Move to the next page(s) and return content",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "steps": {
-                                "type": "integer",
-                                "description": "Number of pages to move forward",
-                                "default": 1
-                            }
-                        }
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "previous_page",
-                    "description": "Move to the previous page(s) and return content",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "steps": {
-                                "type": "integer",
-                                "description": "Number of pages to move backward",
-                                "default": 1
-                            }
-                        }
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "jump_to_page",
-                    "description": "Jump to a specific page by page number",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "page_number": {
-                                "type": "integer",
-                                "description": "Target page number"
-                            }
-                        },
-                        "required": ["page_number"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_page_context",
-                    "description": "Get current page with surrounding pages for context",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "before": {
-                                "type": "integer",
-                                "description": "Number of pages before current",
-                                "default": 1
-                            },
-                            "after": {
-                                "type": "integer",
-                                "description": "Number of pages after current",
-                                "default": 1
-                            }
-                        }
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_page_range",
-                    "description": "Get content of multiple pages at once. More efficient than calling next_page repeatedly. Max 5 pages per call.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "start_page": {
-                                "type": "integer",
-                                "description": "Start page number (inclusive)"
-                            },
-                            "end_page": {
-                                "type": "integer",
-                                "description": "End page number (inclusive). Max 5 pages from start."
-                            }
-                        },
-                        "required": ["start_page", "end_page"]
-                    }
-                }
-            }
-        ]
-
-        # search_text tool
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": "search_text",
-                "description": "Search for text across the entire document. Returns matching lines with page numbers.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Text to search for"
-                        },
-                        "case_sensitive": {
-                            "type": "boolean",
-                            "description": "Case-sensitive search",
-                            "default": False
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }
-        })
-
-        # get_page_access_summary tool
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": "get_page_access_summary",
-                "description": "Get page submission statistics: which pages have been covered and which are under-explored. Use to find pages that need more attention.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "description": "Number of least-submitted pages to highlight",
-                            "default": 5
-                        }
-                    }
-                }
-            }
-        })
-
-        # Add image tools if extracted_dir is available
-        if self.extracted_dir:
-            tools.append({
-                "type": "function",
-                "function": {
-                    "name": "list_page_images",
-                    "description": "List available images for a page with absolute file paths (cropped figures and full page image)",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "page_number": {
-                                "type": "integer",
-                                "description": "Page number to list images for"
-                            }
-                        },
-                        "required": ["page_number"]
-                    }
-                }
-            })
-            # get_image only available when NOT using minimax (minimax uses its own understand_image tool)
-            if not self.minimax_mcp:
-                tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": "get_image",
-                        "description": "Get a specific image as base64. Use list_page_images first to see available images.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "page_number": {
-                                    "type": "integer",
-                                    "description": "Page number"
-                                },
-                                "image_name": {
-                                    "type": "string",
-                                    "description": "Image filename (e.g., 'images/1.jpg' for cropped, 'page_001.png' for full page)"
-                                }
-                            },
-                            "required": ["page_number", "image_name"]
-                        }
-                    }
-                })
-
-        # Add MiniMax MCP tools if proxy is available
-        if self.minimax_mcp:
-            tools.extend(self.minimax_mcp.get_openai_tool_defs())
-
-        # Add Search1API MCP tools if proxy is available
-        if self.search1api_mcp:
-            tools.extend(self.search1api_mcp.get_openai_tool_defs())
-
-        return tools
+        minimax_extra = self.minimax_mcp.get_openai_tool_defs() if self.minimax_mcp else None
+        search1api_extra = (
+            self.search1api_mcp.get_openai_tool_defs() if self.search1api_mcp else None
+        )
+        return build_openai_tool_defs(
+            include_image_tools=bool(self.extracted_dir),
+            include_get_image=bool(self.extracted_dir and not self.minimax_mcp),
+            minimax_extra=minimax_extra,
+            search1api_extra=search1api_extra,
+        )
 
     async def generate(self) -> int:
         """Run parallel dataset generation.
@@ -972,6 +463,28 @@ Start now: call jump_to_page({start_page})."""
                 
                 # Try to restore from checkpoint
                 saved_state = dataset_manager.get_thread_state(thread_id)
+
+                # Normalize and validate restored state for reliability
+                if saved_state:
+                    if not isinstance(saved_state.get("messages"), list):
+                        saved_state["messages"] = []
+                    try:
+                        saved_state["submitted_count"] = int(saved_state.get("submitted_count", 0))
+                    except (TypeError, ValueError):
+                        saved_state["submitted_count"] = 0
+                    try:
+                        saved_state["current_position"] = int(saved_state.get("current_position", start_page))
+                    except (TypeError, ValueError):
+                        saved_state["current_position"] = start_page
+                    if saved_state["current_position"] < 1:
+                        saved_state["current_position"] = 1
+                    total_pages = page_manager.get_total_pages()
+                    if saved_state["current_position"] > total_pages:
+                        saved_state["current_position"] = start_page
+                    if saved_state["submitted_count"] < 0:
+                        saved_state["submitted_count"] = 0
+                    if saved_state["submitted_count"] > self.datasets_per_thread:
+                        saved_state["submitted_count"] = self.datasets_per_thread
                 
                 # Check if thread already completed
                 if saved_state and saved_state["status"] == "completed":
@@ -993,14 +506,18 @@ Start now: call jump_to_page({start_page})."""
                     submitted_count = saved_state["submitted_count"]
                     messages = saved_state["messages"]
                     
-                    # Replace system prompt with latest version
-                    if messages and messages[0].get("role") == "system":
+                    # Ensure reliable conversation bootstrap from restored state
+                    if not messages:
+                        messages = [{"role": "system", "content": system_prompt}]
+                    elif messages[0].get("role") == "system":
                         messages[0]["content"] = system_prompt
+                    else:
+                        messages.insert(0, {"role": "system", "content": system_prompt})
                     
                     # Prune message history: use max_messages or default cap of 40
                     prune_limit = self.max_messages or 40
                     if len(messages) > prune_limit:
-                        messages = self._safe_prune_messages(messages, keep_last=10)
+                        messages = safe_prune_messages(messages, keep_last=10)
                         with self.log_lock:
                             tqdm.write(f"[Thread {thread_id}] ✂️  Pruned restored message history to {len(messages)} messages")
                     
@@ -1010,8 +527,10 @@ Start now: call jump_to_page({start_page})."""
                     # Update progress bar to reflect already completed work
                     self._update_progress(submitted_count)
                     
-                    # Jump to saved position
-                    page_manager.jump_to_page(current_position)
+                    # Jump to saved position; fallback safely if invalid
+                    if page_manager.jump_to_page(current_position) is None:
+                        current_position = start_page
+                        page_manager.jump_to_page(current_position)
                     
                     # Append resume info to system prompt instead of injecting a user message
                     remaining = self.datasets_per_thread - submitted_count
@@ -1049,7 +568,7 @@ Start now: call jump_to_page({start_page})."""
                         submitted_count=0,
                         target_count=self.datasets_per_thread,
                         status="running",
-                        messages=_serialize_messages(messages)
+                        messages=serialize_messages(messages)
                     )
 
                 max_iterations = self.datasets_per_thread * 20  # Safety limit
@@ -1057,14 +576,22 @@ Start now: call jump_to_page({start_page})."""
                 no_tool_call_count = 0  # Track consecutive responses without tool calls
                 last_warned_hash: Optional[str] = None  # Track warned submission for re-submit acceptance
                 consecutive_similarity_count = 0  # Track consecutive similarity warnings/rejections
+                consecutive_duplicate_count = 0  # Track consecutive hard duplicate rejections (100%)
+                empty_response_count = 0  # Track consecutive empty/no-choices responses
                 
                 for iteration in range(max_iterations):
                     try:
-                        # Prune message history if limit specified and exceeded
-                        if self.max_messages and len(messages) > self.max_messages:
-                            messages = self._safe_prune_messages(messages, keep_last=10)
+                        # Prune message history if limit exceeded (default 50 if not set)
+                        prune_cap = self.max_messages or 50
+                        if len(messages) > prune_cap:
+                            messages = safe_prune_messages(messages, keep_last=10)
                             with self.log_lock:
                                 tqdm.write(f"[Thread {thread_id}] ✂️  Pruned message history to {len(messages)} messages")
+                            # Extra guard: API requires user message after system message
+                            non_sys = [m for m in messages if m.get("role") != "system"]
+                            if non_sys and non_sys[0].get("role") != "user":
+                                insert_at = 1 if (messages and messages[0].get("role") == "system") else 0
+                                messages.insert(insert_at, {"role": "user", "content": "Continue the task."})
                         
                         # Log conversation length for debugging
                         if iteration % 5 == 0:
@@ -1088,9 +615,14 @@ Start now: call jump_to_page({start_page})."""
 
                         # Guard against non-standard API responses (e.g. raw strings)
                         if not hasattr(response, 'choices') or not response.choices:
+                            empty_response_count += 1
+                            backoff = min(2 ** empty_response_count, 60)  # exponential backoff, max 60s
                             with self.log_lock:
-                                tqdm.write(f"[Thread {thread_id}] ⚠️  Invalid API response (no choices), retrying...")
+                                tqdm.write(f"[Thread {thread_id}] ⚠️  Invalid API response (no choices), retry #{empty_response_count}, waiting {backoff}s...")
+                            time.sleep(backoff)
                             continue
+
+                        empty_response_count = 0  # Reset on successful response
 
                         message = response.choices[0].message
                         
@@ -1127,17 +659,11 @@ Start now: call jump_to_page({start_page})."""
                                 # Execute tool and get result
                                 if function_name == "submit_dataset":
                                     messages_array = function_args.get("messages", [])
-                                    
-                                    # Validate messages format
-                                    if not messages_array:
-                                        tool_result = "Error: messages array cannot be empty"
-                                        self._log_tool_result(thread_id, function_name, {"error": "Empty messages array"})
-                                    elif len(messages_array) < 2:
-                                        tool_result = "Error: messages must contain at least one user-assistant pair (minimum 2 messages)"
-                                        self._log_tool_result(thread_id, function_name, {"error": "Insufficient messages"})
-                                    elif len(messages_array) % 2 != 0:
-                                        tool_result = "Error: messages must have even length (alternating user-assistant pairs)"
-                                        self._log_tool_result(thread_id, function_name, {"error": "Odd number of messages"})
+
+                                    validation_error = validate_dataset_messages(messages_array)
+                                    if validation_error:
+                                        tool_result = f"Error: {validation_error}"
+                                        self._log_tool_result(thread_id, function_name, {"error": validation_error})
                                     else:
                                         import hashlib
                                         content_hash = hashlib.sha256(
@@ -1200,6 +726,7 @@ Start now: call jump_to_page({start_page})."""
                                                 similarity_pct = duplicate_error.similarity
                                                 existing_id = duplicate_error.existing_entry["id"]
                                                 consecutive_similarity_count += 1
+                                                consecutive_duplicate_count += 1
                                                 web_search_hint = ""
                                                 if (self.minimax_mcp or self.search1api_mcp) and consecutive_similarity_count >= 2:
                                                     search_tool = "minimax_web_search" if self.minimax_mcp else "search1api_search"
@@ -1209,12 +736,34 @@ Start now: call jump_to_page({start_page})."""
                                                         "or latest news on this topic. Combine web results with document content to create "
                                                         "genuinely new conversations."
                                                     )
+                                                # Include a snippet of what was duplicated so LLM knows what to avoid
+                                                dup_preview = ""
+                                                if duplicate_error.existing_entry.get("messages"):
+                                                    dup_msgs = duplicate_error.existing_entry["messages"]
+                                                    dup_preview = " Content already stored: " + " | ".join(
+                                                        f"{m['role']}: {m['content'][:80]}" for m in dup_msgs[:2]
+                                                    )
                                                 tool_result = (
-                                                    "Duplicate submission rejected. The proposed conversation "
-                                                    f"matches existing entry #{existing_id} with {similarity_pct:.1f}% similarity. "
-                                                    "Please explore different content (consider using next_page) before submitting."
+                                                    f"❌ DUPLICATE REJECTED (entry #{existing_id}, {similarity_pct:.1f}% match).{dup_preview} "
+                                                    "You MUST NOT re-submit this content. "
+                                                    "Call next_page or jump_to_page to navigate to a DIFFERENT section, then create a completely new conversation."
                                                     + web_search_hint
                                                 )
+                                                # After 3 consecutive duplicates, force a hard redirect via injected user message
+                                                if consecutive_duplicate_count >= 3:
+                                                    import random
+                                                    # Pick a distant page to break out of the rut
+                                                    total_pages = page_manager.total_pages if page_manager else 100
+                                                    jump_target = random.randint(1, max(1, total_pages))
+                                                    redirect_msg = (
+                                                        f"🚨 SYSTEM: You have submitted the same duplicate content {consecutive_duplicate_count} times in a row. "
+                                                        f"I am forcing you to jump to page {jump_target}. "
+                                                        "Call jump_to_page({}) immediately, then read at least 2-3 pages before generating a NEW conversation on a COMPLETELY DIFFERENT topic."
+                                                    ).format(jump_target)
+                                                    messages.append({"role": "user", "content": redirect_msg})
+                                                    consecutive_duplicate_count = 0
+                                                    with self.log_lock:
+                                                        tqdm.write(f"[Thread {thread_id}] 🚨 Force-redirecting to page {jump_target} after {consecutive_duplicate_count + 3} consecutive duplicates")
                                                 self._log_tool_result(thread_id, function_name, {
                                                     "error": f"Duplicate entry #{existing_id} ({similarity_pct:.1f}%)",
                                                     "existing_id": existing_id,
@@ -1224,6 +773,7 @@ Start now: call jump_to_page({start_page})."""
                                             else:
                                                 submitted_count += 1
                                                 consecutive_similarity_count = 0  # Reset on successful submission
+                                                consecutive_duplicate_count = 0  # Reset on successful submission
                                                 self._update_progress(1)
 
                                                 page_number = current_position or (
@@ -1241,10 +791,13 @@ Start now: call jump_to_page({start_page})."""
                                                     submitted_count=submitted_count,
                                                     target_count=self.datasets_per_thread,
                                                     status="running",
-                                                    messages=_serialize_messages(messages)
+                                                    messages=serialize_messages(messages)
                                                 )
                                                 
-                                                remaining = self.datasets_per_thread - submitted_count
+                                                remaining = compute_remaining_submissions(
+                                                    submitted_count,
+                                                    self.datasets_per_thread,
+                                                )
                                                 turns = len(messages_array) // 2
                                                 if remaining > 0:
                                                     tool_result = f"Success! Submitted {turns}-turn conversation {submitted_count}/{self.datasets_per_thread}. You need {remaining} more conversations. Continue exploring and generating."
@@ -1298,7 +851,7 @@ Start now: call jump_to_page({start_page})."""
                                             submitted_count=submitted_count,
                                             target_count=self.datasets_per_thread,
                                             status="completed",
-                                            messages=_serialize_messages(messages)
+                                            messages=serialize_messages(messages)
                                         )
                                         self._log_tool_result(thread_id, function_name, {"reason": reason, "success": True})
                                         return {
@@ -1311,163 +864,173 @@ Start now: call jump_to_page({start_page})."""
                                         }
                                     else:
                                         # Target not reached - reject exit
-                                        remaining = self.datasets_per_thread - submitted_count
+                                        remaining = compute_remaining_submissions(
+                                            submitted_count,
+                                            self.datasets_per_thread,
+                                        )
                                         tool_result = f"Exit rejected! You've only submitted {submitted_count}/{self.datasets_per_thread} Q&A pairs. You need {remaining} more pairs before you can exit. Continue generating."
                                         self._log_tool_result(thread_id, function_name, {"rejected": True, "remaining": remaining})
                                     
-                                elif function_name == "get_current_page":
-                                    result = page_manager.get_page_info()
-                                    if result and "error" not in result:
-                                        current_position = result["page_number"]
-                                        tool_result = f"Page {result['page_number']} (of {result['total_pages']}):\n{result['content']}"
-                                        self._log_tool_result(thread_id, function_name, {"page": result['page_number']})
+                                elif function_name in PAGE_TOOL_NAMES:
+                                    shared_result = execute_page_tool(
+                                        page_manager,
+                                        function_name,
+                                        function_args,
+                                        default_search_max_results=20,
+                                    )
+
+                                    if not shared_result.get("ok"):
+                                        error_msg = shared_result.get("error", "Unknown tool execution error")
+                                        tool_result = f"Error: {error_msg}"
+                                        self._log_tool_result(thread_id, function_name, {"error": error_msg})
                                     else:
-                                        tool_result = f"Error: Could not get current page"
-                                        self._log_tool_result(thread_id, function_name, {"error": "Could not get current page"})
-                                    
-                                elif function_name == "jump_to_page":
-                                    page_num = function_args["page_number"]
-                                    content = page_manager.jump_to_page(page_num)
-                                    if content is not None:
-                                        current_position = page_num
-                                        result = page_manager.get_page_info()
-                                        tool_result = f"Page {page_num} (of {result['total_pages']}):\n{content}"
-                                        self._log_tool_result(thread_id, function_name, {"page": page_num})
-                                    else:
-                                        tool_result = f"Error: Page {page_num} not found"
-                                        self._log_tool_result(thread_id, function_name, {"error": f"Page {page_num} not found"})
-                                    
-                                elif function_name == "next_page":
-                                    steps = function_args.get("steps", 1)
-                                    content = page_manager.next_page(steps)
-                                    result = page_manager.get_page_info()
-                                    if content is not None:
-                                        current_position = result["page_number"]
-                                        tool_result = f"Moved to page {result['page_number']} (of {result['total_pages']}):\n{content}"
-                                        self._log_tool_result(thread_id, function_name, {"to": result['page_number'], "steps": steps})
-                                    else:
-                                        tool_result = f"Error: Could not move to next page"
-                                        self._log_tool_result(thread_id, function_name, {"error": "Could not move forward"})
-                                    
-                                elif function_name == "previous_page":
-                                    steps = function_args.get("steps", 1)
-                                    content = page_manager.previous_page(steps)
-                                    result = page_manager.get_page_info()
-                                    if content is not None:
-                                        current_position = result["page_number"]
-                                        tool_result = f"Moved to page {result['page_number']} (of {result['total_pages']}):\n{content}"
-                                        self._log_tool_result(thread_id, function_name, {"to": result['page_number'], "steps": steps})
-                                    else:
-                                        tool_result = f"Error: Could not move to previous page"
-                                        self._log_tool_result(thread_id, function_name, {"error": "Could not move backward"})
-                                
-                                elif function_name == "get_page_range":
-                                    req_start = function_args["start_page"]
-                                    req_end = function_args["end_page"]
-                                    # Clamp to max 5 pages
-                                    if req_end - req_start + 1 > 5:
-                                        req_end = req_start + 4
-                                    pages_data = page_manager.get_page_range(req_start, req_end)
-                                    if pages_data:
-                                        # Update current position to the last page in range
-                                        last_page = max(pages_data.keys())
-                                        page_manager.jump_to_page(last_page)
-                                        current_position = last_page
-                                        parts = []
-                                        total = page_manager.get_total_pages()
-                                        for pn in sorted(pages_data.keys()):
-                                            parts.append(f"--- Page {pn} (of {total}) ---\n{pages_data[pn]}")
-                                        tool_result = "\n\n".join(parts)
-                                        self._log_tool_result(thread_id, function_name, {"pages": sorted(pages_data.keys())})
-                                    else:
-                                        tool_result = f"Error: No pages found in range {req_start}-{req_end}"
-                                        self._log_tool_result(thread_id, function_name, {"error": f"No pages in range {req_start}-{req_end}"})
-                                
-                                elif function_name == "get_page_context":
-                                    before = function_args.get("before", 1)
-                                    after = function_args.get("after", 1)
-                                    current_page = page_manager.get_current_page_number()
-                                    context = page_manager.get_context(current_page, before, after)
-                                    if context:
-                                        tool_result = f"Page {current_page} with context:\nCurrent:\n{context['content']}\n"
-                                        if context.get('previous_pages'):
-                                            tool_result += f"\nPrevious pages: {list(context['previous_pages'].keys())}"
-                                        if context.get('next_pages'):
-                                            tool_result += f"\nNext pages: {list(context['next_pages'].keys())}"
-                                        self._log_tool_result(thread_id, function_name, {"page": current_page, "before": before, "after": after})
-                                    else:
-                                        tool_result = f"Error: Could not get page context"
-                                        self._log_tool_result(thread_id, function_name, {"error": "Could not get context"})
-                                    
-                                elif function_name == "search_text":
-                                    query = function_args["query"]
-                                    case_sensitive = function_args.get("case_sensitive", False)
-                                    results = page_manager.search_text(query, case_sensitive, max_results=20)
-                                    if results:
-                                        lines = [f"Found {len(results)} match(es):"]
-                                        for r in results:
-                                            lines.append(f"  Page {r['page_number']}, line {r['line_number']}: {r['content'][:120]}")
-                                        tool_result = "\n".join(lines)
-                                    else:
-                                        tool_result = f"No matches found for '{query}'"
-                                    self._log_tool_result(thread_id, function_name, {"query": query, "matches": len(results)})
+                                        if shared_result.get("current_position") is not None:
+                                            current_position = shared_result["current_position"]
+
+                                        if function_name == "get_current_page":
+                                            page_info = shared_result["page_info"]
+                                            tool_result = (
+                                                f"Page {page_info['page_number']} (of {page_info['total_pages']}):\n"
+                                                f"{page_info['content']}"
+                                            )
+                                            self._log_tool_result(
+                                                thread_id,
+                                                function_name,
+                                                {"page": page_info["page_number"]},
+                                            )
+
+                                        elif function_name == "jump_to_page":
+                                            page_info = shared_result["page_info"]
+                                            tool_result = (
+                                                f"Page {page_info['page_number']} (of {page_info['total_pages']}):\n"
+                                                f"{shared_result['content']}"
+                                            )
+                                            self._log_tool_result(
+                                                thread_id,
+                                                function_name,
+                                                {"page": page_info["page_number"]},
+                                            )
+
+                                        elif function_name in {"next_page", "previous_page"}:
+                                            page_info = shared_result["page_info"]
+                                            steps = shared_result.get("steps", function_args.get("steps", 1))
+                                            tool_result = (
+                                                f"Moved to page {page_info['page_number']} (of {page_info['total_pages']}):\n"
+                                                f"{shared_result['content']}"
+                                            )
+                                            self._log_tool_result(
+                                                thread_id,
+                                                function_name,
+                                                {"to": page_info["page_number"], "steps": steps},
+                                            )
+
+                                        elif function_name == "get_page_range":
+                                            pages_data = shared_result["pages_data"]
+                                            total = shared_result["total_pages"]
+                                            parts = [
+                                                f"--- Page {pn} (of {total}) ---\n{pages_data[pn]}"
+                                                for pn in sorted(pages_data.keys())
+                                            ]
+                                            tool_result = "\n\n".join(parts)
+                                            self._log_tool_result(
+                                                thread_id,
+                                                function_name,
+                                                {"pages": sorted(pages_data.keys())},
+                                            )
+
+                                        elif function_name == "get_page_context":
+                                            context = shared_result["context"]
+                                            current_page = shared_result["current_position"]
+                                            tool_result = (
+                                                f"Page {current_page} with context:\nCurrent:\n{context['content']}\n"
+                                            )
+                                            if context.get("previous_pages"):
+                                                tool_result += (
+                                                    f"\nPrevious pages: {list(context['previous_pages'].keys())}"
+                                                )
+                                            if context.get("next_pages"):
+                                                tool_result += f"\nNext pages: {list(context['next_pages'].keys())}"
+                                            self._log_tool_result(
+                                                thread_id,
+                                                function_name,
+                                                {
+                                                    "page": current_page,
+                                                    "before": shared_result.get("before", function_args.get("before", 1)),
+                                                    "after": shared_result.get("after", function_args.get("after", 1)),
+                                                },
+                                            )
+
+                                        elif function_name == "search_text":
+                                            query = shared_result["query"]
+                                            results = shared_result["results"]
+                                            if results:
+                                                lines = [f"Found {len(results)} match(es):"]
+                                                for item in results:
+                                                    lines.append(
+                                                        f"  Page {item['page_number']}, line {item['line_number']}: {item['content'][:120]}"
+                                                    )
+                                                tool_result = "\n".join(lines)
+                                            else:
+                                                tool_result = f"No matches found for '{query}'"
+                                            self._log_tool_result(
+                                                thread_id,
+                                                function_name,
+                                                {"query": query, "matches": len(results)},
+                                            )
+
+                                        else:
+                                            tool_result = "Error: Unsupported page tool"
+                                            self._log_tool_result(
+                                                thread_id,
+                                                function_name,
+                                                {"error": "Unsupported page tool"},
+                                            )
 
                                 elif function_name == "get_page_access_summary":
                                     limit = function_args.get("limit", 5)
-                                    summary = dataset_manager.get_page_submission_summary(limit=limit)
+                                    counts = dataset_manager.get_page_submission_counts()
+                                    page_numbers = list(getattr(page_manager, "page_numbers", []))
+                                    last_page = dataset_manager.get_session_metadata("last_submission_page")
+                                    summary = build_page_access_summary(
+                                        counts=counts,
+                                        page_numbers=page_numbers,
+                                        last_submission_page=last_page,
+                                        limit=limit,
+                                    )
                                     tool_result = json.dumps(summary, ensure_ascii=False, indent=2)
                                     self._log_tool_result(thread_id, function_name, {"total_submissions": summary.get("total_submissions", 0)})
 
                                 elif function_name == "list_page_images" and self.extracted_dir:
                                     page_num = function_args["page_number"]
-                                    page_dir = self.extracted_dir / f"page_{page_num:03d}"
-                                    if not page_dir.is_dir():
-                                        tool_result = f"Page {page_num} not found"
+                                    result = list_page_images(self.extracted_dir, page_num)
+                                    if result.get("ok"):
+                                        tool_result = json.dumps(
+                                            {
+                                                "page_number": result["page_number"],
+                                                "image_count": result["image_count"],
+                                                "images": result["images"],
+                                            },
+                                            ensure_ascii=False,
+                                        )
                                     else:
-                                        available = []
-                                        # Full page image
-                                        for ext in (".png", ".jpg", ".jpeg"):
-                                            page_img = page_dir / f"page_{page_num:03d}{ext}"
-                                            if page_img.exists():
-                                                available.append({"name": page_img.name, "type": "full_page", "path": str(page_img.resolve())})
-                                                break
-                                        # Cropped images
-                                        images_subdir = page_dir / "images"
-                                        if images_subdir.is_dir():
-                                            for img_file in sorted(images_subdir.iterdir()):
-                                                if img_file.suffix.lower() in (".jpg", ".jpeg", ".png"):
-                                                    available.append({"name": f"images/{img_file.name}", "type": "cropped", "path": str(img_file.resolve())})
-                                        tool_result = json.dumps({"page_number": page_num, "image_count": len(available), "images": available}, ensure_ascii=False)
+                                        tool_result = result.get("error", f"Page {page_num} not found")
                                     self._log_tool_result(thread_id, function_name, {"page": page_num})
 
                                 elif function_name == "get_image" and self.extracted_dir and not self.minimax_mcp:
                                     page_num = function_args["page_number"]
                                     image_name = function_args["image_name"]
-                                    page_dir = self.extracted_dir / f"page_{page_num:03d}"
-                                    if not page_dir.is_dir():
-                                        tool_result = f"Page {page_num} not found"
+                                    result = get_image_data_url(self.extracted_dir, page_num, image_name)
+                                    if result.get("ok"):
+                                        tool_result = json.dumps(
+                                            {
+                                                "page_number": result["page_number"],
+                                                "image_name": result["image_name"],
+                                                "data_url": result["data_url"],
+                                            },
+                                            ensure_ascii=False,
+                                        )
                                     else:
-                                        image_path = page_dir / image_name
-                                        # Security: ensure path stays within page_dir
-                                        try:
-                                            image_path.resolve().relative_to(page_dir.resolve())
-                                        except ValueError:
-                                            image_path = None
-                                        
-                                        if image_path and image_path.exists():
-                                            import base64 as b64
-                                            from PIL import Image
-                                            import io as sio
-                                            with Image.open(image_path) as img:
-                                                if img.mode != "RGB":
-                                                    img = img.convert("RGB")
-                                                buf = sio.BytesIO()
-                                                img.save(buf, format="JPEG")
-                                                b64_str = b64.b64encode(buf.getvalue()).decode("utf-8")
-                                            data_url = f"data:image/jpeg;base64,{b64_str}"
-                                            tool_result = json.dumps({"page_number": page_num, "image_name": image_name, "data_url": data_url}, ensure_ascii=False)
-                                        else:
-                                            tool_result = f"Image '{image_name}' not found in page {page_num}"
+                                        tool_result = result.get("error", f"Image '{image_name}' not found in page {page_num}")
                                     self._log_tool_result(thread_id, function_name, {"page": page_num, "image": image_name})
 
                                 elif self.minimax_mcp and self.minimax_mcp.is_minimax_tool(function_name):
@@ -1534,12 +1097,12 @@ Start now: call jump_to_page({start_page})."""
                         
                         # First: sanitize any incomplete tool_call groups
                         # (could happen if exception occurred mid-tool-processing)
-                        messages = self._sanitize_tool_pairs(messages)
+                        messages = sanitize_tool_pairs(messages)
                         
                         # If API returns 400 bad_request, likely message format issue
                         # Aggressively prune history to recover
                         if "400" in error_str or "bad_request" in error_str:
-                            messages = self._safe_prune_messages(messages, keep_last=4)
+                            messages = safe_prune_messages(messages, keep_last=4)
                             with self.log_lock:
                                 tqdm.write(f"[Thread {thread_id}] ✂️  Pruned to {len(messages)} messages after API error")
                         

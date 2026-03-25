@@ -89,6 +89,34 @@ def cli(ctx: click.Context) -> None:
     default=False,
     help="Extract plain text directly from PDF/EPUB without OCR (faster but may miss images)",
 )
+@click.option(
+    "--image-format",
+    type=click.Choice(["avif", "jpeg", "png"]),
+    default="avif",
+    show_default=True,
+    help="Saved image format for extracted page/crop/overlay assets.",
+)
+@click.option(
+    "--image-quality",
+    type=int,
+    default=80,
+    show_default=True,
+    help="Image quality for AVIF/JPEG output (0-100). Ignored for PNG.",
+)
+@click.option(
+    "--avif-speed",
+    type=int,
+    default=6,
+    show_default=True,
+    help="AVIF speed/quality tradeoff (0=best quality/slowest, 10=fastest).",
+)
+@click.option(
+    "--avif-max-threads",
+    type=int,
+    default=4,
+    show_default=True,
+    help="Maximum threads used by AVIF encoder.",
+)
 def extract(
     input_path: Path,
     output_dir: Path,
@@ -101,6 +129,10 @@ def extract(
     api_concurrency: int,
     device: str,
     plain_text: bool,
+    image_format: str,
+    image_quality: int,
+    avif_speed: int,
+    avif_max_threads: int,
 ) -> None:
     """Extract text from documents using OCR or plain text extraction.
 
@@ -119,6 +151,10 @@ def extract(
             api_concurrency,
             device,
             plain_text,
+            image_format,
+            image_quality,
+            avif_speed,
+            avif_max_threads,
         )
     )
 
@@ -181,6 +217,10 @@ async def _extract_async(
     api_concurrency: int,
     device: str,
     plain_text: bool,
+    image_format: str,
+    image_quality: int,
+    avif_speed: int,
+    avif_max_threads: int,
 ) -> None:
     """Async extraction logic."""
     from bookdatamaker.utils import StatusIndicator
@@ -227,6 +267,10 @@ async def _extract_async(
             device=device,
             skip_model_load=not needs_ocr,
             ocr_version=ocr_version,
+            image_format=image_format,
+            image_quality=image_quality,
+            avif_speed=avif_speed,
+            avif_max_threads=avif_max_threads,
         ) as extractor:
             if input_path.is_file():
                 # Check if it's a document (PDF/EPUB) or image
@@ -364,7 +408,8 @@ async def _extract_async(
 @click.option(
     "--max-messages",
     type=int,
-    default=None,
+    default=50,
+    show_default=True,
     help="Maximum message history to keep (only last N messages). When limit reached, keeps system prompt + last 10 messages. Helps prevent token overflow.",
 )
 @click.option(

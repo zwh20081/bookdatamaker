@@ -4,10 +4,10 @@ import json
 import tempfile
 from pathlib import Path
 
-import pytest
 from PIL import Image
 from bookdatamaker.mcp import ParagraphNavigator
 from bookdatamaker.mcp.server import MCPServer
+from bookdatamaker.tools.image_tools import get_image_data_url, list_page_images
 
 
 class TestParagraphNavigator:
@@ -137,77 +137,70 @@ class TestMCPImageTools:
         
         return extracted
 
-    @pytest.mark.asyncio
-    async def test_list_page_images_with_images(self):
+    def test_list_page_images_with_images(self):
         """list_page_images should find page dir with images when extracted_dir is set."""
         with tempfile.TemporaryDirectory() as tmpdir:
             extracted = self._create_extracted_dir(Path(tmpdir), {1: ["1.jpg", "2.jpg"]})
             server = MCPServer(extracted_dir=extracted)
-            
+
             # Verify image tools are available by checking extracted_dir is set
             assert server.extracted_dir is not None
-            
-            # Verify helper finds the page dir
-            page_dir = server._get_page_dir(1)
-            assert page_dir is not None
-            
-            # Verify images dir exists and has files
-            images_dir = page_dir / "images"
-            assert images_dir.is_dir()
-            assert (images_dir / "1.jpg").exists()
-            assert (images_dir / "2.jpg").exists()
 
-    @pytest.mark.asyncio
-    async def test_list_page_images_no_images(self):
+            result = list_page_images(server.extracted_dir, 1)
+            assert result["ok"] is True
+            # 1 full-page + 2 cropped images
+            assert result["image_count"] == 3
+            names = [item["name"] for item in result["images"]]
+            assert "page_001.png" in names
+            assert "images/1.jpg" in names
+            assert "images/2.jpg" in names
+
+    def test_list_page_images_no_images(self):
         """list_page_images should return empty list when no cropped images."""
         with tempfile.TemporaryDirectory() as tmpdir:
             extracted = self._create_extracted_dir(Path(tmpdir), {1: []})
             server = MCPServer(extracted_dir=extracted)
-            
-            # Access call_tool handler
-            handler = server.server.request_handlers.get("tools/call")
-            # The tool registration makes these available via the server protocol
-            # For unit testing, verify the helper methods work
-            page_dir = server._get_page_dir(1)
-            assert page_dir is not None
-            assert page_dir.is_dir()
+
+            result = list_page_images(server.extracted_dir, 1)
+            assert result["ok"] is True
+            # only full page image exists
+            assert result["image_count"] == 1
+            assert result["images"][0]["type"] == "full_page"
 
     def test_get_page_dir_found(self):
-        """_get_page_dir should return path when page exists."""
+        """list_page_images should succeed when page exists."""
         with tempfile.TemporaryDirectory() as tmpdir:
             extracted = self._create_extracted_dir(Path(tmpdir), {1: []})
             server = MCPServer(extracted_dir=extracted)
-            
-            page_dir = server._get_page_dir(1)
-            assert page_dir is not None
-            assert page_dir.name == "page_001"
+
+            result = list_page_images(server.extracted_dir, 1)
+            assert result["ok"] is True
+            assert result["page_number"] == 1
 
     def test_get_page_dir_not_found(self):
-        """_get_page_dir should return None for non-existent page."""
+        """list_page_images should fail for non-existent page."""
         with tempfile.TemporaryDirectory() as tmpdir:
             extracted = self._create_extracted_dir(Path(tmpdir), {1: []})
             server = MCPServer(extracted_dir=extracted)
-            
-            page_dir = server._get_page_dir(999)
-            assert page_dir is None
+
+            result = list_page_images(server.extracted_dir, 999)
+            assert result["ok"] is False
 
     def test_encode_image_to_base64(self):
-        """_encode_image_to_base64 should return valid data URL."""
+        """get_image_data_url should return valid JPEG data URL."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            img = Image.new("RGB", (10, 10), color=(0, 0, 0))
-            img_path = Path(tmpdir) / "test.jpg"
-            img.save(img_path, "JPEG")
-            
-            server = MCPServer()
-            result = server._encode_image_to_base64(img_path)
-            
-            assert result.startswith("data:image/jpeg;base64,")
-            assert len(result) > 30  # Should have actual base64 content
+            extracted = self._create_extracted_dir(Path(tmpdir), {1: ["1.jpg"]})
+            server = MCPServer(extracted_dir=extracted)
+
+            result = get_image_data_url(server.extracted_dir, page_number=1, image_name="images/1.jpg")
+
+            assert result["ok"] is True
+            assert result["data_url"].startswith("data:image/jpeg;base64,")
+            assert len(result["data_url"]) > 30
 
     def test_no_image_tools_without_extracted_dir(self):
         """Image tools should NOT be registered when extracted_dir is None."""
         server = MCPServer(paragraphs=["test"])
-        # The tools are registered via _setup_tools() in __init__
-        # We can verify by checking that _get_page_dir returns None
+        # The tools are conditionally registered only when extracted_dir is set.
+        # Here we validate the server-side precondition directly.
         assert server.extracted_dir is None
-        assert server._get_page_dir(1) is None

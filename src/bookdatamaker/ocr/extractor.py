@@ -4,17 +4,51 @@ import asyncio
 import base64
 import json
 import os
+import time
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Literal
 
 import httpx
 from PIL import Image, ImageOps
 
+from .image_writer import (
+    extension_for_format,
+    is_avif_supported,
+    save_cropped_image,
+    save_overlay_image,
+    save_page_image,
+)
+
+
+@dataclass
+class OCRBatchTiming:
+    """Timing metrics for one local OCR batch."""
+
+    batch_index: int
+    pages: List[int]
+    prepare_seconds: float = 0.0
+    infer_seconds: float = 0.0
+    decode_seconds: float = 0.0
+    finalize_seconds: float = 0.0
+
+    @property
+    def total_seconds(self) -> float:
+        return (
+            self.prepare_seconds
+            + self.infer_seconds
+            + self.decode_seconds
+            + self.finalize_seconds
+        )
+
 
 class OCRExtractor:
     """Extract text from images using DeepSeek OCR API or local transformers model."""
 
     PROGRESS_FILE_NAME = ".extraction_progress.json"
+    _AVIF_FALLBACK_WARNED = False
+    _TIMING_ENV = "BOOKDATAMAKER_OCR_TIMING"
 
     # Version-specific configuration
     _VERSION_CONFIG = {
@@ -43,6 +77,10 @@ class OCRExtractor:
         skip_model_load: bool = False,
         api_concurrency: int = 4,
         ocr_version: Literal["1", "2"] = "2",
+        image_format: Literal["avif", "jpeg", "png"] = "avif",
+        image_quality: int = 80,
+        avif_speed: int = 6,
+        avif_max_threads: int = 4,
     ) -> None:
         """Initialize OCR extractor.
 
@@ -56,6 +94,10 @@ class OCRExtractor:
             skip_model_load: Skip loading OCR model (for plain text extraction)
             api_concurrency: Concurrent requests for API mode (default: 4)
             ocr_version: DeepSeek OCR version: "1" for OCR-1, "2" for OCR-2 (default)
+            image_format: Saved image format for page/crop/overlay assets.
+            image_quality: Image quality for AVIF/JPEG outputs (0-100).
+            avif_speed: AVIF speed/quality tradeoff (0=best quality, 10=fastest).
+            avif_max_threads: Maximum AVIF encoder threads.
         """
         self.mode = mode
         self.api_key = api_key
@@ -75,6 +117,29 @@ class OCRExtractor:
         self.skip_model_load = skip_model_load
         self.api_concurrency = api_concurrency
         self.llm = None
+        self.image_format = image_format
+        self.image_quality = max(0, min(100, int(image_quality)))
+        self.avif_speed = max(0, min(10, int(avif_speed)))
+        self.avif_max_threads = max(1, int(avif_max_threads))
+        self.enable_timing = os.getenv(self._TIMING_ENV, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+        if self.image_format == "avif" and not is_avif_supported():
+            if not OCRExtractor._AVIF_FALLBACK_WARNED:
+                warnings.warn(
+                    "AVIF output requested but current Pillow build does not support AVIF. "
+                    "Falling back to JPEG output.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                OCRExtractor._AVIF_FALLBACK_WARNED = True
+            self.image_format = "jpeg"
+            if image_quality == 80:
+                self.image_quality = 95
 
         if mode == "api":
             if not skip_model_load:
@@ -204,10 +269,10 @@ class OCRExtractor:
         Matches the behavior of the model's infer(save_results=True) path:
         - Always creates ``page_dir/images/`` directory
         - Parses ``<|ref|>label<|/ref|><|det|>coords<|/det|>`` patterns
-        - Draws bounding boxes on page image → ``result_with_boxes.jpg``
-        - For image refs: crops region(s) → ``images/N.jpg``, replaces with ``![](images/N.jpg)``
+        - Draws bounding boxes on page image -> ``result_with_boxes.<ext>``
+        - For image refs: crops region(s) -> ``images/N.<ext>``, replaces with ``![](images/N.<ext>)``
         - For non-image refs: removes the annotation entirely
-        - Replaces ``\\coloneqq`` → ``:=`` and ``\\eqqcolon`` → ``=:``
+        - Replaces ``\\coloneqq`` -> ``:=`` and ``\\eqqcolon`` -> ``=:``
 
         Args:
             text: Raw OCR text with ref/det annotations
@@ -258,6 +323,7 @@ class OCRExtractor:
         font = ImageFont.load_default()
 
         img_idx = 0
+        crop_ext = extension_for_format(self.image_format)
         for label_type, cor_list in all_refs:
             if not isinstance(cor_list, list) or not cor_list:
                 continue
@@ -282,7 +348,14 @@ class OCRExtractor:
                 if label_type.lower() == "image":
                     try:
                         cropped = page_image.crop((x1, y1, x2, y2))
-                        cropped.save(images_dir / f"{img_idx}.jpg", "JPEG", quality=95)
+                        save_cropped_image(
+                            cropped,
+                            images_dir / f"{img_idx}",
+                            image_format=self.image_format,
+                            quality=self.image_quality,
+                            avif_speed=self.avif_speed,
+                            avif_max_threads=self.avif_max_threads,
+                        )
                     except Exception:
                         pass
                     img_idx += 1
@@ -301,12 +374,19 @@ class OCRExtractor:
                     pass
 
         img_draw.paste(overlay, (0, 0), overlay)
-        img_draw.convert("RGB").save(page_dir / "result_with_boxes.jpg", "JPEG", quality=95)
+        save_overlay_image(
+            img_draw.convert("RGB"),
+            page_dir / "result_with_boxes",
+            image_format=self.image_format,
+            quality=self.image_quality,
+            avif_speed=self.avif_speed,
+            avif_max_threads=self.avif_max_threads,
+        )
 
-        # Replace image ref/det with ![](images/N.jpg) (same as model)
+        # Replace image ref/det with ![](images/N.ext) (same as model)
         processed = text
         for idx, a_match_image in enumerate(matches_images):
-            processed = processed.replace(a_match_image, f"![](images/{idx}.jpg)\n")
+            processed = processed.replace(a_match_image, f"![](images/{idx}.{crop_ext})\n")
 
         # Remove non-image ref/det annotations and cleanup (same as model)
         for a_match_other in matches_other:
@@ -742,6 +822,184 @@ class OCRExtractor:
 
         return results
 
+    def _run_batch_generate_timed(
+        self,
+        images: List[Image.Image],
+        prompts: List[str],
+    ) -> tuple[List[str], float, float, float]:
+        """Run batch inference and return stage timings."""
+        prepare_start = time.perf_counter()
+
+        if hasattr(self.model, "prepare_inputs"):
+            inputs = self.model.prepare_inputs(
+                images=images,
+                prompts=prompts,
+                tokenizer=self.tokenizer,
+            )
+            inputs = {
+                k: v.cuda() if isinstance(v, self.torch.Tensor) else v
+                for k, v in inputs.items()
+            }
+            prepare_seconds = time.perf_counter() - prepare_start
+
+            infer_start = time.perf_counter()
+            with self.torch.no_grad():
+                outputs = self.model.generate(**inputs, max_new_tokens=8192)
+            infer_seconds = time.perf_counter() - infer_start
+
+            decode_start = time.perf_counter()
+            results = [
+                self.tokenizer.decode(outputs[i].cpu().tolist(), skip_special_tokens=True)
+                for i in range(len(images))
+            ]
+            decode_seconds = time.perf_counter() - decode_start
+            return results, prepare_seconds, infer_seconds, decode_seconds
+
+        preprocessed = [
+            self._preprocess_ocr2_single(img, prompt)
+            for img, prompt in zip(images, prompts)
+        ]
+
+        max_len = max(p["input_ids"].shape[0] for p in preprocessed)
+
+        batch_input_ids = []
+        batch_seq_mask = []
+        batch_attn_mask = []
+        batch_images = []
+        batch_spatial_crops = []
+
+        for p in preprocessed:
+            seq_len = p["input_ids"].shape[0]
+            pad_len = max_len - seq_len
+
+            padded_ids = self.torch.cat([
+                self.torch.zeros(pad_len, dtype=self.torch.long),
+                p["input_ids"],
+            ])
+            batch_input_ids.append(padded_ids)
+
+            padded_mask = self.torch.cat([
+                self.torch.zeros(pad_len, dtype=self.torch.bool),
+                p["images_seq_mask"],
+            ])
+            batch_seq_mask.append(padded_mask)
+
+            attn = self.torch.cat([
+                self.torch.zeros(pad_len, dtype=self.torch.long),
+                self.torch.ones(seq_len, dtype=self.torch.long),
+            ])
+            batch_attn_mask.append(attn)
+
+            batch_images.append((p["images_crop"].cuda(), p["images_ori"].cuda()))
+            batch_spatial_crops.append(p["images_spatial_crop"])
+
+        input_ids = self.torch.stack(batch_input_ids).cuda()
+        images_seq_mask = self.torch.stack(batch_seq_mask).cuda()
+        attention_mask = self.torch.stack(batch_attn_mask).cuda()
+        prepare_seconds = time.perf_counter() - prepare_start
+
+        import logging
+        import sys
+
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        sys.stdout = open(os.devnull, "w")
+        sys.stderr = open(os.devnull, "w")
+        prev_log_level = logging.root.level
+        logging.root.setLevel(logging.CRITICAL)
+        tf_logger = logging.getLogger("transformers")
+        prev_tf_level = tf_logger.level
+        tf_logger.setLevel(logging.CRITICAL)
+        prev_filters = warnings.filters[:]
+        warnings.filterwarnings("ignore")
+
+        try:
+            infer_start = time.perf_counter()
+            with self.torch.autocast("cuda", dtype=self.torch.bfloat16):
+                with self.torch.no_grad():
+                    output_ids = self.model.generate(
+                        input_ids,
+                        images=batch_images,
+                        images_seq_mask=images_seq_mask,
+                        images_spatial_crop=self.torch.cat(batch_spatial_crops, dim=0),
+                        attention_mask=attention_mask,
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                        max_new_tokens=8192,
+                        no_repeat_ngram_size=20,
+                        use_cache=True,
+                    )
+            infer_seconds = time.perf_counter() - infer_start
+        finally:
+            sys.stdout.close()
+            sys.stderr.close()
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            warnings.filters[:] = prev_filters
+            tf_logger.setLevel(prev_tf_level)
+            logging.root.setLevel(prev_log_level)
+
+        stop_str = "<\uff5cend\u2581of\u2581sentence\uff5c>"
+        prompt_len = input_ids.shape[1]
+        decode_start = time.perf_counter()
+        results: List[str] = []
+        for i in range(len(images)):
+            text = self.tokenizer.decode(
+                output_ids[i, prompt_len:].cpu().tolist(),
+                skip_special_tokens=False,
+            )
+            while text.endswith(stop_str):
+                text = text[: -len(stop_str)]
+            results.append(text.strip())
+        decode_seconds = time.perf_counter() - decode_start
+        return results, prepare_seconds, infer_seconds, decode_seconds
+
+    @staticmethod
+    def _format_seconds(seconds: float) -> str:
+        """Format timing values for compact human-readable logs."""
+        return f"{seconds * 1000:.1f}ms" if seconds < 1.0 else f"{seconds:.3f}s"
+
+    def _log_batch_timing(self, timing: OCRBatchTiming) -> None:
+        """Log one batch timing line when timing diagnostics are enabled."""
+        if not self.enable_timing:
+            return
+
+        page_text = ",".join(str(page_num) for page_num in timing.pages)
+        print(
+            "[OCR timing] "
+            f"batch={timing.batch_index} pages=[{page_text}] "
+            f"prepare={self._format_seconds(timing.prepare_seconds)} "
+            f"infer={self._format_seconds(timing.infer_seconds)} "
+            f"decode={self._format_seconds(timing.decode_seconds)} "
+            f"finalize={self._format_seconds(timing.finalize_seconds)} "
+            f"total={self._format_seconds(timing.total_seconds)}"
+        )
+
+    def _log_timing_summary(self, timings: List[OCRBatchTiming]) -> None:
+        """Log aggregate timing summary for the whole extraction call."""
+        if not self.enable_timing or not timings:
+            return
+
+        total_prepare = sum(item.prepare_seconds for item in timings)
+        total_infer = sum(item.infer_seconds for item in timings)
+        total_decode = sum(item.decode_seconds for item in timings)
+        total_finalize = sum(item.finalize_seconds for item in timings)
+        total = total_prepare + total_infer + total_decode + total_finalize
+        total_pages = sum(len(item.pages) for item in timings)
+        throughput = (total_pages / total) if total > 0 else 0.0
+
+        print(
+            "[OCR timing] summary "
+            f"batches={len(timings)} pages={total_pages} "
+            f"prepare={self._format_seconds(total_prepare)} "
+            f"infer={self._format_seconds(total_infer)} "
+            f"decode={self._format_seconds(total_decode)} "
+            f"finalize={self._format_seconds(total_finalize)} "
+            f"total={self._format_seconds(total)} "
+            f"throughput={throughput:.2f} pages/s"
+        )
+
     @classmethod
     def get_progress_file_path(cls, output_dir: Path) -> Path:
         """Get the path to the extraction progress file."""
@@ -796,6 +1054,10 @@ class OCRExtractor:
             "local_model_path": self.local_model_path,
             "device": self.device,
             "batch_size": self.batch_size,
+            "image_format": self.image_format,
+            "image_quality": self.image_quality,
+            "avif_speed": self.avif_speed,
+            "avif_max_threads": self.avif_max_threads,
             "prefer_text": prefer_text,
             "total_pages": total_pages,
             "completed_pages": sorted(set(completed_pages)),
@@ -846,10 +1108,16 @@ class OCRExtractor:
             "ocr_version": self.ocr_version,
             "local_model_path": self.local_model_path,
             "device": self.device,
+            "image_format": self.image_format,
+            "image_quality": self.image_quality,
+            "avif_speed": self.avif_speed,
+            "avif_max_threads": self.avif_max_threads,
             "prefer_text": prefer_text,
         }
         mismatches = []
         for key, expected_value in expected.items():
+            if key not in existing:
+                continue
             if existing.get(key) != expected_value:
                 mismatches.append(key)
 
@@ -889,8 +1157,14 @@ class OCRExtractor:
         result_file.write_text(filtered_text, encoding="utf-8")
 
         if image is not None:
-            image_file = page_dir / f"page_{page_num:03d}.png"
-            image.save(image_file)
+            save_page_image(
+                image,
+                page_dir / f"page_{page_num:03d}",
+                image_format=self.image_format,
+                quality=self.image_quality,
+                avif_speed=self.avif_speed,
+                avif_max_threads=self.avif_max_threads,
+            )
 
         if embedded_images:
             images_dir = page_dir / "images"
@@ -898,7 +1172,14 @@ class OCRExtractor:
             for idx, emb_img in enumerate(embedded_images):
                 if emb_img.mode == "RGBA":
                     emb_img = emb_img.convert("RGB")
-                emb_img.save(images_dir / f"{idx}.jpg", "JPEG", quality=95)
+                save_cropped_image(
+                    emb_img,
+                    images_dir / f"{idx}",
+                    image_format=self.image_format,
+                    quality=self.image_quality,
+                    avif_speed=self.avif_speed,
+                    avif_max_threads=self.avif_max_threads,
+                )
 
         return filtered_text
 
@@ -1320,8 +1601,14 @@ class OCRExtractor:
                     if output_dir:
                         page_dir = output_dir / f"page_{page_num:03d}"
                         page_dir.mkdir(parents=True, exist_ok=True)
-                        image_file = page_dir / f"page_{page_num:03d}.png"
-                        content.save(image_file)
+                        save_page_image(
+                            content,
+                            page_dir / f"page_{page_num:03d}",
+                            image_format=self.image_format,
+                            quality=self.image_quality,
+                            avif_speed=self.avif_speed,
+                            avif_max_threads=self.avif_max_threads,
+                        )
                         rgb_image = content.convert("RGB") if content.mode != "RGB" else content
                         processed_text = self._post_process_ocr_output(text, rgb_image, page_dir)
                         result_file = page_dir / "result.mmd"
@@ -1410,6 +1697,7 @@ class OCRExtractor:
         all_results: List[tuple[int, str]] = []
         total_pages = len(image_pages)
         prompt = "<image>\n<|grounding|>Convert the document to markdown. "
+        batch_timings: List[OCRBatchTiming] = []
         
         loop = asyncio.get_event_loop()
 
@@ -1418,14 +1706,35 @@ class OCRExtractor:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 for i in range(0, total_pages, self.batch_size):
                     batch = image_pages[i : i + self.batch_size]
+                    pages = [page_num for page_num, _ in batch]
                     batch_images = [img.convert("RGB") for _, img in batch]
                     batch_prompts = [prompt] * len(batch)
 
-                    output_texts = await loop.run_in_executor(
-                        executor,
-                        lambda imgs=batch_images, prpts=batch_prompts:
-                            self._run_batch_generate(imgs, prpts),
+                    if hasattr(self, "model"):
+                        output_texts, prepare_seconds, infer_seconds, decode_seconds = await loop.run_in_executor(
+                            executor,
+                            lambda imgs=batch_images, prpts=batch_prompts:
+                                self._run_batch_generate_timed(imgs, prpts),
+                        )
+                    else:
+                        output_texts = await loop.run_in_executor(
+                            executor,
+                            lambda imgs=batch_images, prpts=batch_prompts:
+                                self._run_batch_generate(imgs, prpts),
+                        )
+                        prepare_seconds = 0.0
+                        infer_seconds = 0.0
+                        decode_seconds = 0.0
+
+                    timing = OCRBatchTiming(
+                        batch_index=(i // self.batch_size) + 1,
+                        pages=pages,
+                        prepare_seconds=prepare_seconds,
+                        infer_seconds=infer_seconds,
+                        decode_seconds=decode_seconds,
                     )
+
+                    finalize_start = time.perf_counter()
 
                     for j, (page_num, image) in enumerate(batch):
                         text = output_texts[j] if j < len(output_texts) else ""
@@ -1434,8 +1743,14 @@ class OCRExtractor:
                         if output_dir:
                             page_dir = output_dir / f"page_{page_num:03d}"
                             page_dir.mkdir(parents=True, exist_ok=True)
-                            image_file = page_dir / f"page_{page_num:03d}.png"
-                            rgb_image.save(image_file)
+                            save_page_image(
+                                rgb_image,
+                                page_dir / f"page_{page_num:03d}",
+                                image_format=self.image_format,
+                                quality=self.image_quality,
+                                avif_speed=self.avif_speed,
+                                avif_max_threads=self.avif_max_threads,
+                            )
                             processed_text = self._post_process_ocr_output(
                                 text, rgb_image, page_dir
                             )
@@ -1446,6 +1761,10 @@ class OCRExtractor:
                         all_results.append((page_num, text))
                         if pbar is not None:
                             pbar.update(1)
+
+                    timing.finalize_seconds = time.perf_counter() - finalize_start
+                    batch_timings.append(timing)
+                    self._log_batch_timing(timing)
         else:
             # Per-page mode via model.infer() with crop_mode
             with ThreadPoolExecutor(max_workers=1) as executor:
@@ -1459,5 +1778,7 @@ class OCRExtractor:
                     all_results.append((page_num, output_text))
                     if pbar is not None:
                         pbar.update(1)
+
+        self._log_timing_summary(batch_timings)
         
         return all_results
